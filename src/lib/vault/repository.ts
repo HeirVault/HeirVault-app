@@ -16,7 +16,7 @@
  * Swapping the repository is how this frontend becomes fully contract-backed.
  */
 
-import { ContractNotConfiguredError, isContractConfigured } from "@/lib/stellar/config";
+import { ContractNotConfiguredError, getContractConfig, isContractConfigured } from "@/lib/stellar/config";
 import { getNetworkConfig } from "@/lib/stellar/network";
 
 import { areDevFixturesEnabled, DEVELOPMENT_FIXTURES } from "./mock-data";
@@ -131,39 +131,44 @@ export class LocalVaultRepository implements VaultRepository {
 /**
  * Contract-backed repository.
  *
- * Reads vault state directly from the HeirVault Soroban contract. It is wired
- * to the RPC endpoint but intentionally throws when the contract is not
- * configured, rather than returning local data dressed up as chain state.
- *
- * NOTE: mapping the contract's `get_vault` return value into the domain
- * `Vault` shape depends on the contract's published ABI. That mapping is the
- * remaining integration task in `heirvault-contracts` and is marked in the
- * README. Until it exists, this repository refuses to guess.
+ * Reads vault state directly from the HeirVault Soroban contract and decodes
+ * the ScVal return value into the domain `Vault`. It refuses to fabricate
+ * state: reads are simulated against the configured contract, and any result it
+ * cannot decode throws from `decodeVaultRecord`. Writes never go through the
+ * repository (see `transactions.ts` + `contract.ts`).
  */
 export class SorobanVaultRepository implements VaultRepository {
   readonly source = "soroban-contract" as const;
 
-  async list(): Promise<Vault[]> {
-    // Loaded lazily so the SDK is not part of the initial client bundle.
-    const { getContract, HEIRVAULT_METHODS } = await import("@/lib/stellar/contract");
-    getContract();
-    throw new Error(
-      "Reading a vault list from the HeirVault contract requires the " +
-        `${HEIRVAULT_METHODS.listVaultsByOwner} return ABI. ` +
-        "Implement the ScVal → Vault mapping in SorobanVaultRepository once " +
-        "heirvault-contracts publishes it.",
-    );
+  constructor(private readonly owner?: string) {}
+
+  /** Ambient data needed by the ScVal → Vault decoder. */
+  private context() {
+    const config = getContractConfig();
+    return {
+      network: config.network.id,
+      assetSymbol: config.assetSymbol,
+      assetDecimals: config.assetDecimals,
+      contractId: config.contractId ?? undefined,
+    };
   }
 
-  async get(): Promise<Vault | null> {
-    const { getContract, HEIRVAULT_METHODS } = await import("@/lib/stellar/contract");
-    getContract();
-    throw new Error(
-      "Reading a vault from the HeirVault contract requires the " +
-        `${HEIRVAULT_METHODS.getVault} return ABI. ` +
-        "Implement the ScVal → Vault mapping in SorobanVaultRepository once " +
-        "heirvault-contracts publishes it.",
-    );
+  async list(): Promise<Vault[]> {
+    // Loaded lazily so the SDK is not part of the initial client bundle.
+    const { readVaultsByOwner, decodeVaultList } = await import("@/lib/stellar/contract");
+    if (!this.owner) {
+      throw new Error("Reading vaults from the contract requires the owner's address.");
+    }
+    const records = await readVaultsByOwner(this.owner);
+    return decodeVaultList(records, this.context());
+  }
+
+  async get(id: string): Promise<Vault | null> {
+    const { readVaultRecord, decodeVaultRecord } = await import("@/lib/stellar/contract");
+    const record = await readVaultRecord(id);
+    // A missing vault decodes to an Option::None → `null`.
+    if (record === null || record === undefined) return null;
+    return decodeVaultRecord(record, this.context());
   }
 
   async save(vault: Vault): Promise<Vault> {
@@ -179,7 +184,7 @@ export class SorobanVaultRepository implements VaultRepository {
 /** Choose the repository appropriate for the current configuration. */
 export function createDefaultRepository(options: { owner?: string } = {}): VaultRepository {
   if (isContractConfigured()) {
-    return new SorobanVaultRepository();
+    return new SorobanVaultRepository(options.owner);
   }
   return new LocalVaultRepository({ seedFixtures: true, ...options });
 }

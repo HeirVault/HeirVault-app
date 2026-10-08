@@ -20,11 +20,33 @@
  * {@link ContractNotConfiguredError} before touching the network.
  */
 
-import { Address, Contract, nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import {
+  Account,
+  Address,
+  BASE_FEE,
+  Contract,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  scValToNative,
+  xdr,
+} from "@stellar/stellar-sdk";
 
-import { toBaseUnits } from "@/lib/vault/calculations";
-import type { ActivationConditions, Beneficiary, Guardian } from "@/lib/vault/types";
+import { fromBaseUnits, toBaseUnits } from "@/lib/vault/calculations";
+import { encodeEd25519PublicKey } from "@/lib/vault/strkey";
+import {
+  ACTIVATION_TRIGGERS,
+  VAULT_STATUSES,
+  type ActivationConditions,
+  type ActivationTrigger,
+  type Beneficiary,
+  type Guardian,
+  type GuardianRole,
+  type Vault,
+  type VaultStatus,
+} from "@/lib/vault/types";
 
+import { getRpcServer } from "./client";
 import {
   ContractNotConfiguredError,
   getContractConfig,
@@ -34,6 +56,7 @@ import {
   type ContractConfig,
   type SupportedAsset,
 } from "./config";
+import { getNetworkConfig, type StellarNetworkId } from "./network";
 
 export {
   ContractNotConfiguredError,
@@ -274,4 +297,256 @@ export function buildUpdateGuardiansOp(params: {
     addressScVal(params.owner),
     xdr.ScVal.scvVec(params.guardians.map(guardianToScVal)),
   );
+}
+
+// ── Reads: Soroban ScVal → domain Vault ──────────────────────────────────────
+//
+// Read entrypoints are *simulated* (never submitted) and their return value is
+// decoded into the domain `Vault`. The record shape decoded here is the
+// interface this frontend expects from `get_vault`; its field names mirror the
+// argument structs the builders above submit (address / allocation_bps / role /
+// check_in_interval_days / …) so the two sides stay in lockstep. If the
+// contract returns a different shape, decoding throws rather than fabricating a
+// vault.
+
+/**
+ * A deterministic, format-valid account used as the read-only transaction
+ * source when the caller has no funded account of their own. Simulation never
+ * submits, so this address only needs to be well-formed.
+ */
+const READ_ONLY_SOURCE = encodeEd25519PublicKey(new Uint8Array(32).fill(0x42));
+
+/** Raised when a contract read cannot be simulated or its result decoded. */
+export class ContractReadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ContractReadError";
+  }
+}
+
+/** Ambient data needed to turn a decoded record into a domain `Vault`. */
+export interface VaultDecodeContext {
+  network: StellarNetworkId;
+  assetSymbol: string;
+  assetDecimals: number;
+  /** The HeirVault contract id, when one is configured. */
+  contractId?: string;
+}
+
+export interface ReadOptions {
+  network?: StellarNetworkId;
+  /** Fee-paying source account for the simulated read. */
+  sourceAddress?: string;
+}
+
+const GUARDIAN_ROLES: readonly GuardianRole[] = ["primary", "backup", "arbiter"];
+
+function asObject(value: unknown, label: string): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  throw new ContractReadError(`Expected ${label} to be a struct, received ${typeof value}.`);
+}
+
+function readString(source: Record<string, unknown>, key: string, label: string): string {
+  const value = source[key];
+  if (typeof value === "string" && value.trim() !== "") return value;
+  throw new ContractReadError(`Expected ${label}.${key} to be a non-empty string.`);
+}
+
+function readOptionalString(source: Record<string, unknown>, key: string): string | undefined {
+  const value = source[key];
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function readInteger(source: Record<string, unknown>, key: string, label: string): number {
+  const value = source[key];
+  const parsed =
+    typeof value === "bigint" ? Number(value) : typeof value === "number" ? value : Number.NaN;
+  if (!Number.isFinite(parsed)) {
+    throw new ContractReadError(`Expected ${label}.${key} to be an integer.`);
+  }
+  return parsed;
+}
+
+function readBigInt(source: Record<string, unknown>, key: string, label: string): bigint {
+  const value = source[key];
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return BigInt(Math.trunc(value));
+  if (typeof value === "string" && /^-?\d+$/.test(value)) return BigInt(value);
+  throw new ContractReadError(`Expected ${label}.${key} to be an integer amount.`);
+}
+
+/** Convert a Soroban unix-seconds timestamp (u64) into an ISO string. */
+function toIso(value: unknown): string | undefined {
+  let seconds: number | undefined;
+  if (typeof value === "bigint") seconds = Number(value);
+  else if (typeof value === "number") seconds = value;
+  else if (typeof value === "string" && /^\d+$/.test(value)) seconds = Number(value);
+  if (seconds === undefined || !Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return new Date(seconds * 1000).toISOString();
+}
+
+function requireIso(value: unknown, label: string): string {
+  const iso = toIso(value);
+  if (!iso) throw new ContractReadError(`Expected ${label} to be a positive timestamp.`);
+  return iso;
+}
+
+function decodeStatus(value: unknown): VaultStatus {
+  if (typeof value === "string" && (VAULT_STATUSES as readonly string[]).includes(value)) {
+    return value as VaultStatus;
+  }
+  throw new ContractReadError(`Unknown vault status ${JSON.stringify(value)}.`);
+}
+
+function decodeTrigger(value: unknown): ActivationTrigger {
+  if (typeof value === "string" && (ACTIVATION_TRIGGERS as readonly string[]).includes(value)) {
+    return value as ActivationTrigger;
+  }
+  throw new ContractReadError(`Unknown activation trigger ${JSON.stringify(value)}.`);
+}
+
+function decodeBeneficiaries(value: unknown): Beneficiary[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new ContractReadError("Expected vault.beneficiaries to be a list.");
+  return value.map((entry, index) => {
+    const label = `vault.beneficiaries[${index}]`;
+    const record = asObject(entry, label);
+    return {
+      id: `b${index + 1}`,
+      address: readString(record, "address", label),
+      allocationBps: readInteger(record, "allocation_bps", label),
+    };
+  });
+}
+
+function decodeGuardians(value: unknown): Guardian[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new ContractReadError("Expected vault.guardians to be a list.");
+  return value.map((entry, index) => {
+    const label = `vault.guardians[${index}]`;
+    const record = asObject(entry, label);
+    const rawRole = record.role;
+    const role: GuardianRole =
+      typeof rawRole === "string" && (GUARDIAN_ROLES as readonly string[]).includes(rawRole)
+        ? (rawRole as GuardianRole)
+        : "primary";
+    return {
+      id: `g${index + 1}`,
+      address: readString(record, "address", label),
+      role,
+      approvalStatus: "pending",
+    };
+  });
+}
+
+function decodeActivation(value: unknown): ActivationConditions {
+  const record = asObject(value ?? {}, "vault.activation");
+  const scheduled = toIso(record.scheduled_activation_at);
+  return {
+    trigger: decodeTrigger(record.trigger),
+    checkInIntervalDays: readInteger(record, "check_in_interval_days", "vault.activation"),
+    gracePeriodDays: readInteger(record, "grace_period_days", "vault.activation"),
+    guardianThreshold: readInteger(record, "guardian_threshold", "vault.activation"),
+    emergencyActivationEnabled: record.emergency_enabled === true,
+    ...(scheduled ? { scheduledActivationAt: scheduled } : {}),
+  };
+}
+
+/** Decode an already-native `get_vault` result into a domain {@link Vault}. */
+export function decodeVaultRecord(value: unknown, context: VaultDecodeContext): Vault {
+  const record = asObject(value, "vault");
+  const assetContractId = readString(record, "asset", "vault");
+  const amount = readBigInt(record, "amount", "vault");
+
+  return {
+    id: readString(record, "id", "vault"),
+    contractId: context.contractId,
+    owner: readString(record, "owner", "vault"),
+    name: readString(record, "name", "vault"),
+    description: readOptionalString(record, "description"),
+    status: decodeStatus(record.status),
+    network: context.network,
+    createdAt: requireIso(record.created_at, "vault.created_at"),
+    asset: {
+      contractId: assetContractId,
+      symbol: context.assetSymbol,
+      decimals: context.assetDecimals,
+      amount: fromBaseUnits(amount, context.assetDecimals),
+    },
+    beneficiaries: decodeBeneficiaries(record.beneficiaries),
+    guardians: decodeGuardians(record.guardians),
+    activation: decodeActivation(record.activation),
+    activationApprovals: [],
+    lastCheckInAt: toIso(record.last_check_in_at),
+    activatedAt: toIso(record.activated_at),
+    completedAt: toIso(record.completed_at),
+    cancelledAt: toIso(record.cancelled_at),
+    // Events and per-beneficiary claim status come from their own entrypoints
+    // (`get_transactions`, `get_claim_status`), not from `get_vault`.
+    transactions: [],
+    claims: [],
+  };
+}
+
+/** Decode a raw `get_vault` ScVal (the form returned by simulation). */
+export function decodeVaultScVal(scVal: xdr.ScVal, context: VaultDecodeContext): Vault {
+  return decodeVaultRecord(scValToNative(scVal), context);
+}
+
+/** Decode a `list_vaults_by_owner` result (a vec of vault records). */
+export function decodeVaultList(value: unknown, context: VaultDecodeContext): Vault[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new ContractReadError("Expected a list of vaults.");
+  return value.map((entry) => decodeVaultRecord(entry, context));
+}
+
+/** Simulate a read-only contract call and return the native return value. */
+async function simulateRead(
+  method: HeirVaultMethod,
+  args: xdr.ScVal[],
+  options: ReadOptions = {},
+): Promise<unknown> {
+  const server = getRpcServer(options.network);
+  const source = new Account(options.sourceAddress ?? READ_ONLY_SOURCE, "0");
+  const transaction = new TransactionBuilder(source, {
+    fee: BASE_FEE,
+    networkPassphrase: getNetworkConfig(options.network).passphrase,
+  })
+    .addOperation(getContract().call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const simulation = await server.simulateTransaction(transaction);
+  if (rpc.Api.isSimulationError(simulation)) {
+    throw new ContractReadError(`Contract read failed: ${simulation.error}`);
+  }
+  if (!simulation.result) {
+    throw new ContractReadError("The contract returned no value for this read.");
+  }
+  return scValToNative(simulation.result.retval);
+}
+
+/** Read a single vault's native record via `get_vault`. */
+export async function readVaultRecord(
+  vaultId: string,
+  options: ReadOptions = {},
+): Promise<unknown> {
+  return simulateRead(
+    HEIRVAULT_METHODS.getVault,
+    [nativeToScVal(vaultId, { type: "string" })],
+    options,
+  );
+}
+
+/** Read an owner's vault records via `list_vaults_by_owner`. */
+export async function readVaultsByOwner(
+  owner: string,
+  options: ReadOptions = {},
+): Promise<unknown> {
+  return simulateRead(HEIRVAULT_METHODS.listVaultsByOwner, [addressScVal(owner)], {
+    ...options,
+    sourceAddress: options.sourceAddress ?? owner,
+  });
 }
