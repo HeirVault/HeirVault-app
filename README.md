@@ -215,8 +215,8 @@ When a real contract is configured, the app surfaces contract-backed state inste
 
 This frontend is deployed on Vercel under the project **`heir-vault-app`**.
 
-- **Production URL:** `https://heirvault-app.vercel.app`
-- **Last production deployment (this session):** `https://heir-vault-5w17uyrpd-adelakunoluwaseyi1996-8385.vercel.app`
+- **Production URL:** `https://heir-vault-app.vercel.app` (note the hyphen; `heirvault-app.vercel.app` (no hyphen) does not resolve)
+- **Latest production deployment (this session):** `https://heir-vault-ltraax2fh-adelakunoluwaseyi1996-8385.vercel.app`
 - **Vercel dashboard:** `https://vercel.com/adelakunoluwaseyi1996-8385/heir-vault-app`
 
 Production deployments are triggered from the `main` branch of this repository (or manually via the Vercel CLI).
