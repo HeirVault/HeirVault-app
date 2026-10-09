@@ -179,17 +179,18 @@ export function deriveVaultState(vault: Vault, now: Date = new Date()): VaultSta
   const checkInOverdue = now.getTime() > dueAt.getTime();
   const graceElapsed = now.getTime() > graceAt.getTime();
 
-  const byCheckIn =
-    vault.activation.trigger === "missed-check-in" && checkInOverdue && graceElapsed;
-  const bySchedule =
-    vault.activation.trigger === "scheduled" &&
-    !!vault.activation.scheduledActivationAt &&
-    now.getTime() >= new Date(vault.activation.scheduledActivationAt).getTime();
-  const byGuardians =
-    vault.activation.trigger === "guardian-approval" && guardianApprovalsRemaining === 0;
-  const byManual = vault.activation.trigger === "manual" && Boolean(vault.activatedAt);
+  // Mirrors `ActivationMode::requires_*` in the contract: `MissedCheckIn` needs
+  // the grace period to lapse, `GuardianApproval` needs the guardian threshold,
+  // and `MultiCondition` needs both.
+  const requiresMissedCheckIn =
+    vault.activation.trigger === "missed-check-in" || vault.activation.trigger === "multi-condition";
+  const requiresGuardians =
+    vault.activation.trigger === "guardian-approval" || vault.activation.trigger === "multi-condition";
+  const guardiansSatisfied =
+    !requiresGuardians || (vault.guardians.length > 0 && guardianApprovalsRemaining === 0);
+  const checkInSatisfied = !requiresMissedCheckIn || graceElapsed;
 
-  const activationEligible = Boolean(vault.activatedAt) || byCheckIn || bySchedule || byGuardians || byManual;
+  const activationEligible = Boolean(vault.activatedAt) || (guardiansSatisfied && checkInSatisfied);
 
   let status: VaultStatus = vault.status;
 
@@ -199,7 +200,9 @@ export function deriveVaultState(vault: Vault, now: Date = new Date()): VaultSta
     status = vault.status;
   } else if (activationEligible) {
     status = "triggered";
-  } else if (vault.activation.trigger === "missed-check-in" && checkInOverdue) {
+  } else if (checkInOverdue) {
+    // The contract derives `GracePeriod` from the clock alone, whatever the
+    // activation mode, as soon as the check-in deadline has passed.
     status = "grace";
   } else {
     status = "active";
@@ -233,7 +236,6 @@ export function deriveClaimStatus(
   const claim = findClaim(vault, beneficiaryAddress);
 
   if (claim?.status === "claimed") return "claimed";
-  if (claim?.status === "expired") return "expired";
 
   const state = deriveVaultState(vault, now);
 
@@ -243,13 +245,14 @@ export function deriveClaimStatus(
   const beneficiary = vault.beneficiaries.find((b) => b.address === beneficiaryAddress);
   if (!beneficiary) return "not-eligible";
 
-  if (vault.activation.trigger === "guardian-approval" && vault.activationApprovals.length > 0) {
+  const { trigger } = vault.activation;
+  const guardianGated = trigger === "guardian-approval" || trigger === "multi-condition";
+  const checkInGated = trigger === "missed-check-in" || trigger === "multi-condition";
+
+  if (guardianGated && vault.activationApprovals.length > 0) {
     return "pending";
   }
-  if (vault.activation.trigger === "missed-check-in" && state.checkInOverdue) {
-    return "pending";
-  }
-  if (vault.activation.trigger === "scheduled" && !state.activationEligible) {
+  if (checkInGated && state.checkInOverdue) {
     return "pending";
   }
 

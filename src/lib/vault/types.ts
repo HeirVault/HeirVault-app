@@ -64,21 +64,26 @@ export const VAULT_STATUS_META: Record<VaultStatus, VaultStatusMeta> = {
 /** Basis points are used so allocations sum to exactly 10000 (= 100%). */
 export const TOTAL_ALLOCATION_BPS = 10_000;
 
-/** How a vault becomes claimable. */
+/**
+ * How a vault becomes claimable.
+ *
+ * These three values are the frontend's spelling of the contract's
+ * `ActivationMode` enum (`MissedCheckIn`, `GuardianApproval`, `MultiCondition`).
+ * The contract exposes no scheduled or manual/emergency activation mode, so the
+ * frontend does not offer one.
+ */
 export const ACTIVATION_TRIGGERS = [
   "missed-check-in",
-  "scheduled",
   "guardian-approval",
-  "manual",
+  "multi-condition",
 ] as const;
 
 export type ActivationTrigger = (typeof ACTIVATION_TRIGGERS)[number];
 
 export const ACTIVATION_TRIGGER_LABELS: Record<ActivationTrigger, string> = {
   "missed-check-in": "Missed check-in + grace period",
-  scheduled: "Scheduled activation date",
   "guardian-approval": "Guardian threshold approval",
-  manual: "Manual / emergency activation",
+  "multi-condition": "Missed check-in and guardian approval",
 };
 
 export interface ActivationConditions {
@@ -87,12 +92,8 @@ export interface ActivationConditions {
   checkInIntervalDays: number;
   /** Extra time after a missed check-in before activation. */
   gracePeriodDays: number;
-  /** ISO date for `scheduled` activation. */
-  scheduledActivationAt?: string;
-  /** Number of guardian approvals required when `guardian-approval`. */
+  /** Number of guardian approvals required (guardian-gated modes). */
   guardianThreshold: number;
-  /** Whether the contract exposes an emergency activation entrypoint. */
-  emergencyActivationEnabled: boolean;
 }
 
 export interface VaultAsset {
@@ -104,8 +105,13 @@ export interface VaultAsset {
   amount: string;
 }
 
-/** Claim eligibility as *presented* by the contract. */
-export const CLAIM_STATUSES = ["not-eligible", "pending", "available", "claimed", "expired"] as const;
+/**
+ * Claim eligibility as *presented* by the contract.
+ *
+ * The contract has no claim window: once a vault is activated its beneficiaries
+ * may claim at any time, so there is no `expired` state.
+ */
+export const CLAIM_STATUSES = ["not-eligible", "pending", "available", "claimed"] as const;
 
 export type ClaimStatus = (typeof CLAIM_STATUSES)[number];
 
@@ -129,11 +135,6 @@ export const CLAIM_STATUS_META: Record<ClaimStatus, VaultStatusMeta> = {
     label: "Claimed",
     tone: "info",
     description: "The allocation has already been claimed.",
-  },
-  expired: {
-    label: "Expired",
-    tone: "danger",
-    description: "The claim window closed before the allocation was claimed.",
   },
 };
 

@@ -61,7 +61,6 @@ export function ClaimPanel({ vault, beneficiary }: ClaimPanelProps) {
     if (!wallet.networkMatches) return "Your wallet must be on the app's network.";
     if (claimStatus === "claimed") return "This allocation has already been claimed.";
     if (claimStatus === "pending") return "Activation is still in progress.";
-    if (claimStatus === "expired") return "The claim window has closed.";
     if (!claimable) return "The vault has not met its activation conditions yet.";
     return null;
   })();

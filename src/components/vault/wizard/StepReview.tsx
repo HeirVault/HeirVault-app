@@ -6,7 +6,7 @@ import { Card, CardBody, CardHeader } from "@/components/ui/Card";
 import { AddressDisplay } from "@/components/ui/AddressDisplay";
 import { AllocationBar } from "@/components/beneficiaries/AllocationBar";
 import { beneficiaryAmount, formatAllocation } from "@/lib/vault/calculations";
-import { formatAssetAmount, formatDate } from "@/lib/format";
+import { formatAssetAmount } from "@/lib/format";
 import { ACTIVATION_TRIGGER_LABELS } from "@/lib/vault/types";
 
 import type { WizardStepProps } from "./steps";
@@ -158,18 +158,10 @@ export function StepReview({ draft, onEdit, validationIssues }: StepReviewProps)
               <dt className="text-muted">Grace period</dt>
               <dd className="text-content-strong">{draft.activation.gracePeriodDays} days</dd>
             </div>
-            {draft.activation.scheduledActivationAt && (
-              <div className="flex justify-between gap-4">
-                <dt className="text-muted">Scheduled activation</dt>
-                <dd className="text-content-strong">
-                  {formatDate(draft.activation.scheduledActivationAt)}
-                </dd>
-              </div>
-            )}
             <div className="flex justify-between gap-4">
-              <dt className="text-muted">Emergency activation</dt>
+              <dt className="text-muted">Guardian threshold</dt>
               <dd className="text-content-strong">
-                {draft.activation.emergencyActivationEnabled ? "Enabled" : "Disabled"}
+                {draft.activation.guardianThreshold} of {draft.guardians.length}
               </dd>
             </div>
           </dl>

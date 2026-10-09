@@ -18,7 +18,6 @@ const TONES: Record<ClaimStatus, AlertTone> = {
   pending: "warning",
   available: "success",
   claimed: "info",
-  expired: "danger",
 };
 
 /** Explains, in plain language, why a beneficiary can or cannot claim. */
@@ -32,7 +31,6 @@ export function ClaimEligibilityNotice({
 
   const detail = (() => {
     if (claimStatus === "claimed") return "The allocation has been transferred to your account.";
-    if (claimStatus === "expired") return "The claim window for this vault has closed.";
     if (vault.status === "cancelled")
       return "The owner cancelled this vault, so no assets will be distributed.";
     if (vault.status === "draft")
@@ -45,8 +43,8 @@ export function ClaimEligibilityNotice({
       return state.checkInOverdue
         ? `The owner missed their check-in. The grace period ends ${formatDateTime(state.graceDeadlineAt)}.`
         : `The owner is checking in on schedule. Next deadline: ${formatDateTime(state.nextCheckInDueAt)}.`;
-    if (vault.activation.trigger === "scheduled")
-      return `This vault activates on ${formatDateTime(vault.activation.scheduledActivationAt)}.`;
+    if (vault.activation.trigger === "multi-condition")
+      return `This vault activates only when the grace period has lapsed *and* ${state.guardianApprovalsRemaining} more guardian approval(s) have been recorded.`;
     return `Activation trigger: ${ACTIVATION_TRIGGER_LABELS[vault.activation.trigger]}.`;
   })();
 

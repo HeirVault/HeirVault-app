@@ -12,7 +12,6 @@ const CLAIM_TONES: Record<ClaimStatus, "neutral" | "warning" | "success" | "info
   pending: "warning",
   available: "success",
   claimed: "info",
-  expired: "danger",
 };
 
 const CLAIM_LABELS: Record<ClaimStatus, string> = {
@@ -20,7 +19,6 @@ const CLAIM_LABELS: Record<ClaimStatus, string> = {
   pending: "Pending",
   available: "Claim available",
   claimed: "Claimed",
-  expired: "Expired",
 };
 
 export interface BeneficiaryListProps {

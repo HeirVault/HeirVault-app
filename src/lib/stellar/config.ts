@@ -6,6 +6,8 @@
  * lives in `contract.ts`, which is only loaded when a blockchain action runs.
  */
 
+import { isValidContractId as isValidContractIdStrKey } from "@/lib/vault/strkey";
+
 import { getNetworkConfig, type StellarNetworkConfig } from "./network";
 
 /** Raised whenever a blockchain action is attempted without a contract id. */
@@ -45,16 +47,60 @@ export function getContractConfig(): ContractConfig {
 }
 
 /**
+ * Everything that is *wrong* with the current environment configuration.
+ *
+ * An empty array means the configured identifiers are structurally valid — it
+ * is not a claim that the contract exists on the selected network; only a
+ * simulated read can establish that.
+ */
+export function getContractConfigProblems(): string[] {
+  const problems: string[] = [];
+  const { contractId, assetContractId } = getContractConfig();
+
+  if (contractId && !isValidContractIdStrKey(contractId)) {
+    problems.push(
+      `NEXT_PUBLIC_HEIRVAULT_CONTRACT_ID (${contractId}) is not a valid Soroban contract id — it must be a C… string with a correct checksum.`,
+    );
+  }
+
+  if (assetContractId && !isValidContractIdStrKey(assetContractId)) {
+    problems.push(
+      `NEXT_PUBLIC_USDC_CONTRACT_ID (${assetContractId}) is not a valid Soroban contract id — it must be a C… string with a correct checksum.`,
+    );
+  }
+
+  // Checked against the raw value: `getContractConfig` silently falls back to 7
+  // for an unparsable input, which would otherwise hide the misconfiguration.
+  const decimalsRaw = process.env.NEXT_PUBLIC_USDC_DECIMALS?.trim();
+  if (decimalsRaw && (!/^\d+$/.test(decimalsRaw) || Number(decimalsRaw) > 18)) {
+    problems.push(
+      `NEXT_PUBLIC_USDC_DECIMALS (${decimalsRaw}) must be an integer between 0 and 18.`,
+    );
+  }
+
+  if (!assetContractId && contractId) {
+    problems.push(
+      "NEXT_PUBLIC_USDC_CONTRACT_ID is not set, so vaults cannot be created or funded against the configured contract.",
+    );
+  }
+
+  return problems;
+}
+
+/**
  * Whether blockchain *writes* are possible.
  *
  * The UI uses this to render a persistent "contract not configured" banner and
- * to disable deploy/claim actions instead of pretending they succeeded.
+ * to disable deploy/claim actions instead of pretending they succeeded. An id
+ * that is present but malformed counts as not configured — see
+ * {@link getContractConfigProblems} for the specific reason.
  */
 export function isContractConfigured(): boolean {
-  return getContractConfig().contractId !== null;
+  const { contractId } = getContractConfig();
+  return contractId !== null && isValidContractIdStrKey(contractId);
 }
 
-/** Throws unless a real contract id is configured. */
+/** Throws unless a real, structurally valid contract id is configured. */
 export function requireContractId(): string {
   const { contractId } = getContractConfig();
   if (!contractId) {
@@ -62,6 +108,11 @@ export function requireContractId(): string {
       "No HeirVault contract is configured for this environment. Set " +
         "NEXT_PUBLIC_HEIRVAULT_CONTRACT_ID to a deployed contract id before " +
         "attempting on-chain actions.",
+    );
+  }
+  if (!isValidContractIdStrKey(contractId)) {
+    throw new ContractNotConfiguredError(
+      `NEXT_PUBLIC_HEIRVAULT_CONTRACT_ID (${contractId}) is not a valid Soroban contract id.`,
     );
   }
   return contractId;

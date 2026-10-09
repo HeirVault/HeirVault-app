@@ -193,18 +193,28 @@ describe("deriveVaultState", () => {
     expect(state.activationEligible).toBe(true);
   });
 
-  it("handles scheduled activation", () => {
-    const activation = makeActivation({
-      trigger: "scheduled",
-      scheduledActivationAt: "2026-06-01T00:00:00.000Z",
-    });
-    const future = deriveVaultState(makeVault({ activation }), now("2026-05-01"));
-    expect(future.status).toBe("active");
-    expect(future.activationEligible).toBe(false);
+  it("requires both conditions for multi-condition activation", () => {
+    const guardian = makeGuardian({ address: testAddress(3), approvalStatus: "approved" });
+    const activation = makeActivation({ trigger: "multi-condition", guardianThreshold: 1 });
 
-    const past = deriveVaultState(makeVault({ activation }), now("2026-06-02"));
-    expect(past.status).toBe("triggered");
-    expect(past.activationEligible).toBe(true);
+    // Approvals are recorded, but the grace period has not elapsed yet.
+    const early = deriveVaultState(
+      makeVault({ activation, guardians: [guardian], activationApprovals: [guardian.address] }),
+      now("2026-01-05"),
+    );
+    expect(early.activationEligible).toBe(false);
+
+    // The grace period elapsed but nobody approved: still not eligible.
+    const withoutApproval = deriveVaultState(makeVault({ activation }), now("2026-05-15"));
+    expect(withoutApproval.activationEligible).toBe(false);
+
+    // Both conditions satisfied.
+    const ready = deriveVaultState(
+      makeVault({ activation, guardians: [guardian], activationApprovals: [guardian.address] }),
+      now("2026-05-15"),
+    );
+    expect(ready.activationEligible).toBe(true);
+    expect(ready.status).toBe("triggered");
   });
 
   it("counts guardian approvals toward the threshold", () => {
@@ -253,20 +263,13 @@ describe("deriveVaultState", () => {
 describe("deriveClaimStatus", () => {
   const beneficiary = makeBeneficiary({ address: testAddress(2) });
 
-  it("reports a recorded claim as claimed and an expired one as expired", () => {
+  it("reports a recorded claim as claimed", () => {
     const claimed = makeVault({
       activatedAt: DAY,
       beneficiaries: [beneficiary],
       claims: [{ beneficiaryId: beneficiary.id, address: beneficiary.address, status: "claimed" }],
     });
     expect(deriveClaimStatus(claimed, beneficiary.address)).toBe("claimed");
-
-    const expired = makeVault({
-      activatedAt: DAY,
-      beneficiaries: [beneficiary],
-      claims: [{ beneficiaryId: beneficiary.id, address: beneficiary.address, status: "expired" }],
-    });
-    expect(deriveClaimStatus(expired, beneficiary.address)).toBe("expired");
   });
 
   it("makes claims available once the vault is triggered", () => {

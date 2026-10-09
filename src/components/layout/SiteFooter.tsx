@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { getContractConfig } from "@/lib/stellar/contract";
+import { getContractConfig } from "@/lib/stellar/config";
 
 export function SiteFooter() {
   const config = getContractConfig();

@@ -3,16 +3,21 @@
 /**
  * Vault state + actions.
  *
- * All blockchain writes funnel through {@link execute}, which enforces the
- * honesty rules globally:
+ * Every blockchain write funnels through {@link runOperations} and
+ * {@link execute}, which enforce the honesty rules globally:
  *
- *   1. no wallet        → the action fails with a clear message;
- *   2. no contract id   → `not-configured` state, no network call is made;
- *   3. simulation fails → `failed` with the contract's error;
- *   4. user rejects     → `rejected`, never success;
+ *   1. no contract id    → `not-configured`, no network call is made;
+ *   2. no wallet / wrong network → `failed` with a clear message;
+ *   3. simulation fails  → `failed` with the contract's error;
+ *   4. user rejects      → `rejected`, never success;
  *   5. `success` is only reported when Soroban RPC confirms the hash.
  *
  * Vault records in the repository are only updated after (5).
+ *
+ * Deployment is a multi-step flow that mirrors the contract's actual workflow:
+ * `create_vault` returns a numeric vault id, so that id is read back from the
+ * confirmed transaction before beneficiaries, guardians and the first deposit
+ * are submitted against it.
  */
 
 import {
@@ -29,17 +34,23 @@ import type { xdr } from "@stellar/stellar-sdk";
 
 import { useWallet } from "@/hooks/useWallet";
 import {
-  buildApproveActivationOp,
+  activationModeFromTrigger,
+  buildActivateVaultOp,
+  buildAddBeneficiaryOp,
+  buildAddGuardianOp,
   buildCancelVaultOp,
   buildCheckInOp,
   buildClaimOp,
   buildCreateVaultOp,
   buildDepositOp,
-  buildTriggerActivationOp,
+  buildGuardianApproveOp,
+  buildSetGuardianThresholdOp,
   ContractNotConfiguredError,
   getContractConfig,
   isContractConfigured,
+  readVaultIdFromReturnValue,
 } from "@/lib/stellar/contract";
+import { getTransactionUrl } from "@/lib/stellar/explorer";
 import { getNetworkConfig } from "@/lib/stellar/network";
 import {
   buildTransaction,
@@ -47,16 +58,16 @@ import {
   prepareTransaction,
   submitSignedTransaction,
   TransactionRejectedError,
+  type SubmitResult,
   type TransactionState,
 } from "@/lib/stellar/transactions";
-import { deriveVaultState } from "@/lib/vault/calculations";
+import { deriveVaultState, toBaseUnits } from "@/lib/vault/calculations";
 import {
   createDefaultRepository,
   createVaultFromDraft,
   type VaultDataSource,
-  type VaultRepository,
 } from "@/lib/vault/repository";
-import type { Vault, VaultDraft, VaultTransactionType } from "@/lib/vault/types";
+import type { Vault, VaultDraft, VaultTransaction, VaultTransactionType } from "@/lib/vault/types";
 
 export interface VaultContextValue {
   vaults: Vault[];
@@ -86,6 +97,9 @@ export interface VaultContextValue {
 
 const VaultContext = createContext<VaultContextValue | null>(null);
 
+const NOT_CONFIGURED =
+  "No HeirVault contract is configured in this environment. Set NEXT_PUBLIC_HEIRVAULT_CONTRACT_ID.";
+
 function toTransactionState(error: unknown): TransactionState {
   if (error instanceof ContractNotConfiguredError) {
     return { phase: "not-configured", error: error.message };
@@ -99,9 +113,40 @@ function toTransactionState(error: unknown): TransactionState {
   };
 }
 
+/** Outcome of one build → simulate → sign → submit → confirm round trip. */
+type OperationOutcome =
+  | { ok: true; result: SubmitResult }
+  | { ok: false; state: TransactionState };
+
+/** Guards shared by every write action. */
+type Preflight =
+  | { vault: Vault; address: string }
+  | { state: TransactionState };
+
+function failure(error: string): TransactionState {
+  return { phase: "failed", error };
+}
+
+function recordTransaction(vault: Vault, transaction: VaultTransaction): Vault {
+  return { ...vault, transactions: [...vault.transactions, transaction] };
+}
+
+function historyEntry(
+  type: VaultTransactionType,
+  result: SubmitResult,
+): VaultTransaction {
+  return {
+    hash: result.hash,
+    type,
+    status: "success",
+    ledger: result.ledger,
+    timestamp: new Date().toISOString(),
+    explorerUrl: getTransactionUrl(result.hash) ?? undefined,
+  };
+}
+
 export function VaultProvider({ children }: { children: ReactNode }) {
   const wallet = useWallet();
-  const [repository] = useState<VaultRepository>(() => createDefaultRepository());
   const [vaults, setVaults] = useState<Vault[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -111,12 +156,20 @@ export function VaultProvider({ children }: { children: ReactNode }) {
   const network = useMemo(() => getNetworkConfig(), []);
   const contractConfigured = isContractConfigured();
 
+  // The repository needs the owner's address to read `get_vaults_by_owner`, so
+  // it is re-created when the connected wallet changes.
+  const repository = useMemo(
+    () => createDefaultRepository({ owner: wallet.address ?? undefined }),
+    [wallet.address],
+  );
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       setVaults(await repository.list());
     } catch (listError) {
+      setVaults([]);
       setError(
         listError instanceof Error
           ? listError.message
@@ -150,17 +203,6 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     [repository],
   );
 
-  const saveDraft = useCallback(
-    async (draft: VaultDraft, owner: string) => {
-      const vault = createVaultFromDraft(draft, owner, {
-        id: contractConfigured ? undefined : `local_${Date.now().toString(36)}`,
-      });
-      await saveVault(vault);
-      return vault;
-    },
-    [contractConfigured, saveVault],
-  );
-
   const removeVault = useCallback(
     async (id: string) => {
       await repository.remove(id);
@@ -169,48 +211,91 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     [repository],
   );
 
-  /**
-   * Build → simulate → sign → submit → confirm, then persist.
-   *
-   * @param mutate Applied to the stored vault only after on-chain success.
-   */
-  const execute = useCallback(
-    async (
-      vaultId: string,
-      type: VaultTransactionType,
-      buildOp: (vault: Vault, address: string) => xdr.Operation,
-      mutate: (vault: Vault, hash: string, ledger?: number) => Vault,
-    ): Promise<TransactionState> => {
-      setTransaction({ phase: "building" });
+  const saveDraft = useCallback(
+    async (draft: VaultDraft, owner: string) => {
+      // Local ids are never numeric, which is how the rest of the app tells a
+      // draft apart from a vault that exists on-chain.
+      const vault = createVaultFromDraft(draft, owner, { id: `local_${Date.now().toString(36)}` });
+      await saveVault(vault);
+      return vault;
+    },
+    [saveVault],
+  );
 
+  /** Checks that must pass before any write action is attempted. */
+  const preflight = useCallback(
+    (vaultId: string): Preflight => {
+      if (!contractConfigured) {
+        return { state: { phase: "not-configured", error: NOT_CONFIGURED } };
+      }
       const vault = vaults.find((entry) => entry.id === vaultId);
       if (!vault) {
-        const state: TransactionState = { phase: "failed", error: "Vault not found." };
-        setTransaction(state);
-        return state;
+        return { state: failure("Vault not found.") };
+      }
+      if (!/^\d+$/.test(vault.id)) {
+        return { state: failure("This vault has not been deployed to the network yet.") };
       }
       if (!wallet.address) {
-        const state: TransactionState = {
-          phase: "failed",
-          error: "Connect a Stellar wallet before submitting transactions.",
-        };
-        setTransaction(state);
-        return state;
+        return { state: failure("Connect a Stellar wallet before submitting transactions.") };
       }
       if (!wallet.networkMatches) {
-        const state: TransactionState = {
-          phase: "failed",
-          error: `Your wallet is on a different network. Switch it to ${network.label}.`,
+        return {
+          state: failure(
+            `Your wallet is on a different network. Switch it to ${network.label}.`,
+          ),
         };
-        setTransaction(state);
-        return state;
+      }
+      return { vault, address: wallet.address };
+    },
+    [contractConfigured, network.label, vaults, wallet.address, wallet.networkMatches],
+  );
+
+  const preflightDraft = useCallback(
+    (vaultId: string): Preflight => {
+      if (!contractConfigured) {
+        return { state: { phase: "not-configured", error: NOT_CONFIGURED } };
+      }
+      const vault = vaults.find((entry) => entry.id === vaultId);
+      if (!vault) {
+        return { state: failure("Vault not found.") };
+      }
+      if (/^\d+$/.test(vault.id)) {
+        return {
+          state: failure(`This vault is already deployed on-chain as vault ${vault.id}.`),
+        };
+      }
+      if (!wallet.address) {
+        return { state: failure("Connect a Stellar wallet before submitting transactions.") };
+      }
+      if (!wallet.networkMatches) {
+        return {
+          state: failure(
+            `Your wallet is on a different network. Switch it to ${network.label}.`,
+          ),
+        };
+      }
+      return { vault, address: wallet.address };
+    },
+    [contractConfigured, network.label, vaults, wallet.address, wallet.networkMatches],
+  );
+
+  /**
+   * Build → simulate → sign → submit → confirm.
+   *
+   * Sets the in-flight phases itself; the caller decides what the terminal
+   * phase means (a multi-step deploy only reports success at the very end).
+   */
+  const runOperations = useCallback(
+    async (address: string, operations: xdr.Operation[]): Promise<OperationOutcome> => {
+      if (operations.length === 0) {
+        return { ok: false, state: failure("Nothing to submit.") };
       }
 
+      setTransaction({ phase: "building" });
       try {
-        const operation = buildOp(vault, wallet.address);
         const built = await buildTransaction({
-          sourceAddress: wallet.address,
-          operations: [operation],
+          sourceAddress: address,
+          operations,
         });
         const prepared = await prepareTransaction(built);
 
@@ -219,87 +304,257 @@ export function VaultProvider({ children }: { children: ReactNode }) {
         try {
           signedXdr = await wallet.sign(prepared.transaction.toXDR());
         } catch (signError) {
-          const state = toTransactionState(
-            signError instanceof TransactionRejectedError
-              ? signError
-              : new TransactionRejectedError(
-                  signError instanceof Error ? signError.message : undefined,
-                ),
-          );
-          setTransaction(state);
-          return state;
+          return {
+            ok: false,
+            state: toTransactionState(
+              signError instanceof TransactionRejectedError
+                ? signError
+                : new TransactionRejectedError(
+                    signError instanceof Error ? signError.message : undefined,
+                  ),
+            ),
+          };
         }
 
         setTransaction({ phase: "submitted" });
-        const result = await submitSignedTransaction(signedXdr);
+        const result = await submitSignedTransaction(signedXdr, network.id);
 
         if (result.status === "success") {
-          const updated = recordTransaction(mutate(vault, result.hash, result.ledger), {
-            hash: result.hash,
-            type,
-            status: "success",
-            ledger: result.ledger,
-            timestamp: new Date().toISOString(),
-          });
-          await saveVault(updated);
-          const state: TransactionState = {
-            phase: "success",
-            hash: result.hash,
-            ledger: result.ledger,
-          };
-          setTransaction(state);
-          return state;
+          return { ok: true, result };
         }
-
         if (result.status === "pending") {
-          const state: TransactionState = {
-            phase: "pending",
-            hash: result.hash,
-            error: result.error,
+          return {
+            ok: false,
+            state: {
+              phase: "pending",
+              hash: result.hash,
+              error: result.error,
+            },
           };
-          setTransaction(state);
-          return state;
         }
-
-        const state: TransactionState = { phase: "failed", hash: result.hash, error: result.error };
-        setTransaction(state);
-        return state;
+        return {
+          ok: false,
+          state: {
+            phase: "failed",
+            hash: result.hash,
+            error: result.error ?? "The transaction failed on-chain.",
+          },
+        };
       } catch (actionError) {
-        const state = toTransactionState(actionError);
+        return { ok: false, state: toTransactionState(actionError) };
+      }
+    },
+    [network.id, wallet],
+  );
+
+  /**
+   * A single-transaction action.
+   *
+   * @param mutate Applied to the stored vault only after on-chain success.
+   */
+  const execute = useCallback(
+    async (
+      vaultId: string,
+      type: VaultTransactionType,
+      buildOps: (vault: Vault, address: string) => xdr.Operation[],
+      mutate: (vault: Vault, hash: string, ledger?: number) => Vault,
+    ): Promise<TransactionState> => {
+      const prepared = preflight(vaultId);
+      if ("state" in prepared) {
+        setTransaction(prepared.state);
+        return prepared.state;
+      }
+      const { vault, address } = prepared;
+
+      const outcome = await runOperations(address, buildOps(vault, address));
+      if (!outcome.ok) {
+        setTransaction(outcome.state);
+        return outcome.state;
+      }
+
+      const { result } = outcome;
+      const updated = recordTransaction(
+        mutate(vault, result.hash, result.ledger),
+        historyEntry(type, result),
+      );
+      await saveVault(updated);
+
+      const state: TransactionState = {
+        phase: "success",
+        hash: result.hash,
+        ledger: result.ledger,
+      };
+      setTransaction(state);
+      return state;
+    },
+    [preflight, runOperations, saveVault],
+  );
+
+  /**
+   * Deploy a draft: `create_vault` → read the returned id → configure
+   * beneficiaries/guardians → optional first deposit.
+   *
+   * Each step is confirmed before the next begins, and success is only
+   * reported once every step has been confirmed. The created vault is
+   * persisted as soon as its id is known, so a later failure never loses it.
+   */
+  const deployVault = useCallback(
+    async (vaultId: string): Promise<TransactionState> => {
+      const prepared = preflightDraft(vaultId);
+      if ("state" in prepared) {
+        setTransaction(prepared.state);
+        return prepared.state;
+      }
+      const { vault, address } = prepared;
+
+      const assetContractId = vault.asset.contractId || contractConfig.assetContractId || "";
+      if (!assetContractId) {
+        const state = failure(
+          "No asset contract is configured for this vault. Set NEXT_PUBLIC_USDC_CONTRACT_ID.",
+        );
         setTransaction(state);
         return state;
       }
-    },
-    [network.label, saveVault, vaults, wallet],
-  );
 
-  const deployVault = useCallback(
-    (vaultId: string) =>
-      execute(
-        vaultId,
-        "deploy",
-        (vault, address) =>
-          buildCreateVaultOp({
-            owner: address,
-            name: vault.name,
-            assetContractId: vault.asset.contractId || contractConfig.assetContractId || "",
-            amount: vault.asset.amount,
-            assetDecimals: vault.asset.decimals,
-            beneficiaries: vault.beneficiaries,
-            guardians: vault.guardians,
-            activation: vault.activation,
-          }),
-        (vault) => ({
-          ...vault,
-          status: "active",
-          lastCheckInAt: new Date().toISOString(),
-          nextCheckInDueAt: deriveVaultState(
-            { ...vault, lastCheckInAt: new Date().toISOString(), status: "active" },
-            new Date(),
-          ).nextCheckInDueAt,
+      // ── Step 1: create_vault(owner, asset, mode, check_in, grace) → u64 ──
+      const created = await runOperations(address, [
+        buildCreateVaultOp({
+          owner: address,
+          assetContractId,
+          activationMode: activationModeFromTrigger(vault.activation.trigger),
+          checkInPeriodSeconds: Math.round(vault.activation.checkInIntervalDays * 86_400),
+          gracePeriodSeconds: Math.round(vault.activation.gracePeriodDays * 86_400),
         }),
-      ),
-    [contractConfig.assetContractId, execute],
+      ]);
+      if (!created.ok) {
+        setTransaction(created.state);
+        return created.state;
+      }
+
+      let onChainId: string;
+      try {
+        onChainId = readVaultIdFromReturnValue(created.result.returnValue);
+      } catch (decodeError) {
+        const state: TransactionState = {
+          phase: "failed",
+          hash: created.result.hash,
+          error:
+            `The vault was created on-chain (transaction ${created.result.hash}) but its id ` +
+            `could not be read back: ${
+              decodeError instanceof Error ? decodeError.message : String(decodeError)
+            } Refresh the dashboard to find it.`,
+        };
+        setTransaction(state);
+        return state;
+      }
+
+      // Persist the deployed vault immediately, under its on-chain id.
+      const deployed: Vault = {
+        ...vault,
+        id: onChainId,
+        contractId: contractConfig.contractId ?? undefined,
+        status: "active",
+        lastCheckInAt: new Date().toISOString(),
+        transactions: [...vault.transactions, historyEntry("deploy", created.result)],
+      };
+      deployed.nextCheckInDueAt = deriveVaultState(deployed, new Date()).nextCheckInDueAt;
+
+      try {
+        await removeVault(vault.id);
+        await saveVault(deployed);
+      } catch (persistError) {
+        const state: TransactionState = {
+          phase: "failed",
+          hash: created.result.hash,
+          error:
+            `Vault ${onChainId} was created (transaction ${created.result.hash}) but could not be ` +
+            `saved locally: ${persistError instanceof Error ? persistError.message : String(persistError)}`,
+        };
+        setTransaction(state);
+        return state;
+      }
+
+      const amend = (base: TransactionState, step: string): TransactionState => ({
+        ...base,
+        error:
+          `Vault ${onChainId} was created (transaction ${created.result.hash}), but ${step}: ` +
+          `${base.error ?? "unknown error"}`,
+      });
+
+      // ── Step 2: add beneficiaries, guardians and the threshold ──
+      const configOps: xdr.Operation[] = [
+        ...vault.beneficiaries.map((beneficiary) =>
+          buildAddBeneficiaryOp({
+            vaultId: onChainId,
+            beneficiaryAddress: beneficiary.address,
+            allocationBps: beneficiary.allocationBps,
+          }),
+        ),
+        ...vault.guardians.map((guardian) =>
+          buildAddGuardianOp({ vaultId: onChainId, guardianAddress: guardian.address }),
+        ),
+      ];
+      if (vault.guardians.length > 0) {
+        // `set_guardian_threshold` requires 1 <= threshold <= active guardians;
+        // validation keeps the draft inside that range, and the contract is the
+        // final authority.
+        configOps.push(
+          buildSetGuardianThresholdOp({
+            vaultId: onChainId,
+            threshold: vault.activation.guardianThreshold,
+          }),
+        );
+      }
+
+      if (configOps.length > 0) {
+        const configured = await runOperations(address, configOps);
+        if (!configured.ok) {
+          const state = amend(configured.state, "configuring its beneficiaries/guardians failed");
+          setTransaction(state);
+          return state;
+        }
+        const entries: VaultTransaction[] = [];
+        if (vault.beneficiaries.length > 0) {
+          entries.push(historyEntry("beneficiary-update", configured.result));
+        }
+        if (vault.guardians.length > 0) {
+          entries.push(historyEntry("guardian-update", configured.result));
+        }
+        entries.forEach((entry) => {
+          deployed.transactions = recordTransaction(deployed, entry).transactions;
+        });
+        await saveVault(deployed);
+      }
+
+      // ── Step 3: first deposit (the contract creates the vault unfunded) ──
+      const amount = toBaseUnits(vault.asset.amount || "0", vault.asset.decimals);
+      if (amount > 0n) {
+        const funded = await runOperations(address, [
+          buildDepositOp({ vaultId: onChainId, assetContractId, amount }),
+        ]);
+        if (!funded.ok) {
+          const state = amend(funded.state, "the first deposit failed");
+          setTransaction(state);
+          return state;
+        }
+        deployed.asset = { ...deployed.asset, amount: vault.asset.amount };
+        deployed.transactions = recordTransaction(
+          deployed,
+          historyEntry("deposit", funded.result),
+        ).transactions;
+        await saveVault(deployed);
+      }
+
+      const lastEntry = deployed.transactions[deployed.transactions.length - 1];
+      const state: TransactionState = {
+        phase: "success",
+        hash: lastEntry?.hash ?? created.result.hash,
+        ledger: lastEntry?.ledger ?? created.result.ledger,
+      };
+      setTransaction(state);
+      return state;
+    },
+    [contractConfig.assetContractId, contractConfig.contractId, preflightDraft, removeVault, runOperations, saveVault],
   );
 
   const checkIn = useCallback(
@@ -307,10 +562,13 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       execute(
         vaultId,
         "check-in",
-        (vault, address) => buildCheckInOp({ vaultId: vault.id, owner: address }),
+        (vault) => [buildCheckInOp({ vaultId: vault.id })],
         (vault) => {
-          const now = new Date().toISOString();
-          const withCheckIn: Vault = { ...vault, lastCheckInAt: now, status: "active" };
+          const withCheckIn: Vault = {
+            ...vault,
+            lastCheckInAt: new Date().toISOString(),
+            status: "active",
+          };
           return {
             ...withCheckIn,
             nextCheckInDueAt: deriveVaultState(withCheckIn, new Date()).nextCheckInDueAt,
@@ -325,8 +583,13 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       execute(
         vaultId,
         "deposit",
-        (vault, address) =>
-          buildDepositOp({ vaultId: vault.id, from: address, amount, assetDecimals: vault.asset.decimals }),
+        (vault) => [
+          buildDepositOp({
+            vaultId: vault.id,
+            assetContractId: vault.asset.contractId || contractConfig.assetContractId || "",
+            amount: toBaseUnits(amount, vault.asset.decimals),
+          }),
+        ],
         (vault) => ({
           ...vault,
           asset: {
@@ -337,7 +600,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
           },
         }),
       ),
-    [execute],
+    [contractConfig.assetContractId, execute],
   );
 
   const cancelVault = useCallback(
@@ -345,18 +608,19 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       execute(
         vaultId,
         "cancel",
-        (vault, address) => buildCancelVaultOp({ vaultId: vault.id, owner: address }),
+        (vault) => [buildCancelVaultOp({ vaultId: vault.id })],
         (vault) => ({ ...vault, status: "cancelled", cancelledAt: new Date().toISOString() }),
       ),
     [execute],
   );
 
+  /** A guardian records its approval of the current activation attempt. */
   const approveActivation = useCallback(
     (vaultId: string) =>
       execute(
         vaultId,
         "guardian-approval",
-        (vault, address) => buildApproveActivationOp({ vaultId: vault.id, guardian: address }),
+        (vault, address) => [buildGuardianApproveOp({ vaultId: vault.id, guardianAddress: address })],
         (vault) => {
           const approver = wallet.address ?? "";
           return {
@@ -364,7 +628,7 @@ export function VaultProvider({ children }: { children: ReactNode }) {
             activationApprovals: Array.from(new Set([...vault.activationApprovals, approver])),
             guardians: vault.guardians.map((guardian) =>
               guardian.address === approver
-                ? { ...guardian, approvalStatus: "approved", respondedAt: new Date().toISOString() }
+                ? { ...guardian, approvalStatus: "approved" as const }
                 : guardian,
             ),
           };
@@ -373,12 +637,13 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     [execute, wallet.address],
   );
 
+  /** Permissionless `activate_vault`; the contract re-checks every condition. */
   const triggerActivation = useCallback(
     (vaultId: string) =>
       execute(
         vaultId,
         "activation",
-        (vault, address) => buildTriggerActivationOp({ vaultId: vault.id, caller: address }),
+        (vault) => [buildActivateVaultOp({ vaultId: vault.id })],
         (vault) => ({ ...vault, status: "triggered", activatedAt: new Date().toISOString() }),
       ),
     [execute],
@@ -389,12 +654,17 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       execute(
         vaultId,
         "claim",
-        (vault) => buildClaimOp({ vaultId: vault.id, beneficiary: beneficiaryAddress }),
+        (vault) => [buildClaimOp({ vaultId: vault.id, beneficiaryAddress })],
         (vault, hash) => ({
           ...vault,
           claims: (vault.claims ?? []).map((entry) =>
             entry.address === beneficiaryAddress
-              ? { ...entry, status: "claimed", claimTxHash: hash, claimedAt: new Date().toISOString() }
+              ? {
+                  ...entry,
+                  status: "claimed" as const,
+                  claimTxHash: hash,
+                  claimedAt: new Date().toISOString(),
+                }
               : entry,
           ),
         }),
@@ -478,9 +748,4 @@ export function useVaultById(id: string | undefined) {
     if (!vault) return { vault: null, state: null, loading, notFound: !loading && !!id };
     return { vault, state: deriveVaultState(vault), loading, notFound: false };
   }, [id, loading, vault]);
-}
-
-/** Append a transaction record, keeping the newest entries last. */
-function recordTransaction(vault: Vault, transaction: Vault["transactions"][number]): Vault {
-  return { ...vault, transactions: [...vault.transactions, transaction] };
 }

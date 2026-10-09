@@ -16,7 +16,7 @@
  * Swapping the repository is how this frontend becomes fully contract-backed.
  */
 
-import { ContractNotConfiguredError, getContractConfig, isContractConfigured } from "@/lib/stellar/config";
+import { ContractNotConfiguredError, isContractConfigured } from "@/lib/stellar/config";
 import { getNetworkConfig } from "@/lib/stellar/network";
 
 import { areDevFixturesEnabled, DEVELOPMENT_FIXTURES } from "./mock-data";
@@ -131,54 +131,140 @@ export class LocalVaultRepository implements VaultRepository {
 /**
  * Contract-backed repository.
  *
- * Reads vault state directly from the HeirVault Soroban contract and decodes
- * the ScVal return value into the domain `Vault`. It refuses to fabricate
- * state: reads are simulated against the configured contract, and any result it
- * cannot decode throws from `decodeVaultRecord`. Writes never go through the
- * repository (see `transactions.ts` + `contract.ts`).
+ * Reads vault state directly from the HeirVault Soroban contract. Chain state
+ * is authoritative for everything the contract stores; localStorage only
+ * supplies what the contract deliberately does not store (name, description,
+ * address labels, guardian roles, and the history of transactions this app
+ * submitted) plus drafts that have not been deployed yet.
+ *
+ * Reads are *simulated* against the configured contract — never submitted —
+ * and any result that cannot be decoded throws instead of being fabricated.
+ * Writes never go through the repository (see `transactions.ts` +
+ * `contract.ts`); `save` only persists the local overlay.
  */
 export class SorobanVaultRepository implements VaultRepository {
   readonly source = "soroban-contract" as const;
 
   constructor(private readonly owner?: string) {}
 
-  /** Ambient data needed by the ScVal → Vault decoder. */
-  private context() {
-    const config = getContractConfig();
-    return {
-      network: config.network.id,
-      assetSymbol: config.assetSymbol,
-      assetDecimals: config.assetDecimals,
-      contractId: config.contractId ?? undefined,
-    };
-  }
-
   async list(): Promise<Vault[]> {
     // Loaded lazily so the SDK is not part of the initial client bundle.
-    const { readVaultsByOwner, decodeVaultList } = await import("@/lib/stellar/contract");
+    const contract = await import("@/lib/stellar/contract");
     if (!this.owner) {
-      throw new Error("Reading vaults from the contract requires the owner's address.");
+      throw new Error("Connect a Stellar wallet to load your on-chain vaults.");
     }
-    const records = await readVaultsByOwner(this.owner);
-    return decodeVaultList(records, this.context());
+
+    const local = readLocalVaultStore();
+    const localById = new Map(local.map((vault) => [vault.id, vault]));
+
+    const ids: string[] = [];
+    let offset = 0;
+    // The contract clamps `limit` to 25, so a long-lived owner needs paging.
+    for (let page = 0; page < 10; page += 1) {
+      const result = await contract.readVaultsByOwner(this.owner, { offset, limit: 25 });
+      ids.push(...result.items.map((item) => item.id));
+      if (!result.meta.hasMore || result.meta.nextOffset === null) break;
+      offset = result.meta.nextOffset;
+    }
+
+    const vaults = await mapWithConcurrency(ids, 4, (id) =>
+      contract.readDomainVault(id, localById.get(id), this.owner ? { sourceAddress: this.owner } : {}),
+    );
+
+    const onChainIds = new Set(vaults.map((vault) => vault.id));
+    // Drafts live locally until they are deployed; everything else is only
+    // shown when the contract confirms it exists.
+    const drafts = local.filter((vault) => vault.status === "draft" && !onChainIds.has(vault.id));
+
+    return [...vaults, ...drafts];
   }
 
   async get(id: string): Promise<Vault | null> {
-    const { readVaultRecord, decodeVaultRecord } = await import("@/lib/stellar/contract");
-    const record = await readVaultRecord(id);
-    // A missing vault decodes to an Option::None → `null`.
-    if (record === null || record === undefined) return null;
-    return decodeVaultRecord(record, this.context());
+    const contract = await import("@/lib/stellar/contract");
+    const local = readLocalVaultStore().find((vault) => vault.id === id) ?? null;
+
+    if (!/^\d+$/.test(id)) {
+      // Not an on-chain id: only a local draft can match it.
+      return local && local.status === "draft" ? local : null;
+    }
+
+    try {
+      return await contract.readDomainVault(id, local, this.owner ? { sourceAddress: this.owner } : {});
+    } catch (error) {
+      if (error instanceof contract.ContractReadError && /not found|missing/i.test(error.message)) {
+        return local?.status === "draft" ? local : null;
+      }
+      throw error;
+    }
   }
 
+  /**
+   * Persist the local overlay (drafts, labels, submitted-transaction history).
+   * On-chain state is never written through here.
+   */
   async save(vault: Vault): Promise<Vault> {
-    // Writes go through `transactions.ts` + `contract.ts`, never the repository.
+    writeLocalVaultStore(upsertLocalVault(vault));
     return vault;
   }
 
-  async remove(): Promise<void> {
-    throw new Error("Vaults cannot be removed on-chain; they are cancelled instead.");
+  async remove(id: string): Promise<void> {
+    if (/^\d+$/.test(id)) {
+      throw new Error("Vaults cannot be removed on-chain; they are cancelled instead.");
+    }
+    writeLocalVaultStore(readLocalVaultStore().filter((vault) => vault.id !== id));
   }
+}
+
+/** Run `fn` over `items` with bounded concurrency, preserving input order. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await fn(items[index]);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+/** Read the local vault store (localStorage, or memory outside the browser). */
+function readLocalVaultStore(): Vault[] {
+  if (!hasLocalStorage()) return [];
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as Vault[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalVaultStore(vaults: Vault[]): void {
+  if (!hasLocalStorage()) return;
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(vaults));
+  } catch {
+    // Storage may be full or blocked; the local overlay is best-effort only.
+  }
+}
+
+function upsertLocalVault(vault: Vault): Vault[] {
+  const vaults = readLocalVaultStore();
+  const index = vaults.findIndex((entry) => entry.id === vault.id);
+  if (index >= 0) {
+    vaults[index] = vault;
+  } else {
+    vaults.push(vault);
+  }
+  return vaults;
 }
 
 /** Choose the repository appropriate for the current configuration. */
@@ -232,7 +318,6 @@ export function createEmptyDraft(asset: { contractId: string; symbol: string; de
       checkInIntervalDays: 90,
       gracePeriodDays: 30,
       guardianThreshold: 1,
-      emergencyActivationEnabled: false,
     },
   };
 }

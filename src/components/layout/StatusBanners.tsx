@@ -2,7 +2,7 @@
 
 import { Alert } from "@/components/ui/Alert";
 import { useVault } from "@/hooks/useVault";
-import { getContractConfig } from "@/lib/stellar/contract";
+import { getContractConfig, getContractConfigProblems } from "@/lib/stellar/config";
 
 /**
  * Makes the environment's state explicit:
@@ -14,9 +14,20 @@ import { getContractConfig } from "@/lib/stellar/contract";
 export function StatusBanners({ className }: { className?: string }) {
   const { isDevelopmentData, contractConfigured } = useVault();
   const config = getContractConfig();
+  const problems = getContractConfigProblems();
 
   return (
     <div className={className}>
+      {problems.length > 0 && (
+        <Alert tone="danger" title="Environment configuration is invalid">
+          <ul className="list-inside list-disc">
+            {problems.map((problem) => (
+              <li key={problem}>{problem}</li>
+            ))}
+          </ul>
+        </Alert>
+      )}
+
       {isDevelopmentData && (
         <Alert tone="warning" title="Development data">
           These vaults are local fixtures for UI development. They are not on-chain, and no transaction you

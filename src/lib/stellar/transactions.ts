@@ -152,6 +152,12 @@ export interface SubmitResult {
   status: "success" | "pending" | "failed";
   ledger?: number;
   error?: string;
+  /**
+   * The contract function's return value, present only for confirmed Soroban
+   * transactions whose invocation returned one (for example `create_vault`,
+   * which returns the new vault id).
+   */
+  returnValue?: xdr.ScVal;
 }
 
 /**
@@ -183,7 +189,12 @@ export async function submitSignedTransaction(
   try {
     const confirmation = await server.pollTransaction(hash, { attempts: 20 });
     if (confirmation.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      return { hash, status: "success", ledger: confirmation.ledger };
+      return {
+        hash,
+        status: "success",
+        ledger: confirmation.ledger,
+        returnValue: confirmation.returnValue,
+      };
     }
     if (confirmation.status === rpc.Api.GetTransactionStatus.FAILED) {
       return { hash, status: "failed", error: "The transaction failed on-chain." };

@@ -10,7 +10,7 @@ import { Stepper } from "@/components/ui/Stepper";
 import { useBeneficiaries } from "@/hooks/useBeneficiaries";
 import { useVault } from "@/hooks/useVault";
 import { useWallet } from "@/hooks/useWallet";
-import { getContractConfig, getSupportedAssets, isContractConfigured } from "@/lib/stellar/contract";
+import { getContractConfig, getSupportedAssets, isContractConfigured } from "@/lib/stellar/config";
 import { IDLE_TRANSACTION, type TransactionState } from "@/lib/stellar/transactions";
 import { createEmptyDraft } from "@/lib/vault/repository";
 import { validateDraft, validateStep, type ValidationResult } from "@/lib/vault/validation";

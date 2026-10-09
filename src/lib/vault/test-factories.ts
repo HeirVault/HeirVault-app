@@ -49,7 +49,6 @@ export function makeActivation(overrides: Partial<ActivationConditions> = {}): A
     checkInIntervalDays: 90,
     gracePeriodDays: 30,
     guardianThreshold: 1,
-    emergencyActivationEnabled: false,
     ...overrides,
   };
 }

@@ -14,9 +14,9 @@ import type { WizardStepProps } from "./steps";
 const TRIGGER_HELP: Record<ActivationTrigger, string> = {
   "missed-check-in":
     "If you stop checking in, the vault opens for claims once the grace period has passed.",
-  scheduled: "The vault opens automatically on a date you choose.",
   "guardian-approval": "Your guardians must collectively approve activation.",
-  manual: "Activation is requested explicitly, e.g. in an emergency. Requires emergency activation enabled.",
+  "multi-condition":
+    "Both must happen: the grace period must lapse *and* the guardian threshold must be reached.",
 };
 
 export function StepActivation({ draft, update, showErrors }: WizardStepProps) {
@@ -80,56 +80,13 @@ export function StepActivation({ draft, update, showErrors }: WizardStepProps) {
         />
       </div>
 
-      {activation.trigger === "scheduled" && (
-        <InputField
-          label="Scheduled activation date"
-          type="datetime-local"
-          value={activation.scheduledActivationAt ? activation.scheduledActivationAt.slice(0, 16) : ""}
-          onChange={(event) =>
-            update({
-              activation: {
-                ...activation,
-                scheduledActivationAt: event.target.value
-                  ? new Date(event.target.value).toISOString()
-                  : undefined,
-              },
-            })
-          }
-          error={errorFor("activation.scheduledActivationAt")}
-          hint="The vault becomes claimable at this moment."
-          required
-        />
-      )}
-
-      {activation.trigger === "guardian-approval" && (
+      {(activation.trigger === "guardian-approval" || activation.trigger === "multi-condition") && (
         <Alert tone={draft.guardians.length === 0 ? "warning" : "info"}>
           {draft.guardians.length === 0
-            ? "Add guardians on the previous step before using guardian approval."
+            ? "Add guardians on the previous step before using a guardian-gated activation mode."
             : `${activation.guardianThreshold} of ${draft.guardians.length} guardian approvals will be required.`}
         </Alert>
       )}
-
-      <label className="flex items-start gap-3 rounded-xl border border-border p-4">
-        <input
-          type="checkbox"
-          className="mt-0.5 h-4 w-4 rounded border-border text-brand-600 focus:ring-brand-500"
-          checked={activation.emergencyActivationEnabled}
-          onChange={(event) =>
-            update({
-              activation: { ...activation, emergencyActivationEnabled: event.target.checked },
-            })
-          }
-        />
-        <span>
-          <span className="block text-sm font-medium text-content-strong">
-            Allow manual / emergency activation
-          </span>
-          <span className="mt-0.5 block text-xs text-muted">
-            Only enable this if the deployed contract exposes the emergency entrypoint. The frontend will
-            surface the action but the contract is the final authority.
-          </span>
-        </span>
-      </label>
 
       {showErrors && validation.issues.length > 0 && (
         <Alert tone="danger" title="Activation conditions incomplete">

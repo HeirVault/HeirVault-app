@@ -42,10 +42,15 @@ export const LIMITS = {
   vaultNameMin: 3,
   vaultNameMax: 60,
   descriptionMax: 280,
-  maxBeneficiaries: 20,
-  maxGuardians: 10,
+  // Contract caps: MAX_BENEFICIARIES = 10, MAX_GUARDIANS = 5.
+  maxBeneficiaries: 10,
+  maxGuardians: 5,
   minCheckInIntervalDays: 1,
   maxCheckInIntervalDays: 365,
+  // @contract MIN_GRACE_PERIOD is 60 seconds, so a zero-length grace period
+  // would be rejected by `create_vault`. One day is the smallest UI unit that
+  // satisfies it.
+  minGracePeriodDays: 1,
   maxGracePeriodDays: 365,
   minGuardianThreshold: 1,
 } as const;
@@ -275,52 +280,23 @@ export function validateActivation(
 
   if (
     !Number.isInteger(gracePeriodDays) ||
-    gracePeriodDays < 0 ||
+    gracePeriodDays < LIMITS.minGracePeriodDays ||
     gracePeriodDays > LIMITS.maxGracePeriodDays
   ) {
     issues.push({
       field: "activation.gracePeriodDays",
-      message: `Grace period must be between 0 and ${LIMITS.maxGracePeriodDays} days.`,
+      message: `Grace period must be between ${LIMITS.minGracePeriodDays} and ${LIMITS.maxGracePeriodDays} days.`,
     });
   }
 
-  if (activation.trigger === "scheduled") {
-    if (!activation.scheduledActivationAt) {
-      issues.push({
-        field: "activation.scheduledActivationAt",
-        message: "Choose the date the vault should activate.",
-      });
-    } else {
-      const scheduled = new Date(activation.scheduledActivationAt);
-      if (Number.isNaN(scheduled.getTime())) {
-        issues.push({
-          field: "activation.scheduledActivationAt",
-          message: "Enter a valid activation date.",
-        });
-      } else if (scheduled.getTime() <= Date.now()) {
-        issues.push({
-          field: "activation.scheduledActivationAt",
-          message: "The activation date must be in the future.",
-        });
-      }
-    }
-  }
-
-  if (activation.trigger === "guardian-approval") {
+  if (activation.trigger === "guardian-approval" || activation.trigger === "multi-condition") {
     if (context.guardians.length === 0) {
       issues.push({
         field: "guardians",
-        message: "Add at least one guardian to use guardian approval activation.",
+        message: "Add at least one guardian to use a guardian-gated activation mode.",
       });
     }
     issues.push(...validateGuardians(context.guardians, activation.guardianThreshold).issues);
-  }
-
-  if (activation.trigger === "manual" && !activation.emergencyActivationEnabled) {
-    issues.push({
-      field: "activation.emergencyActivationEnabled",
-      message: "Manual activation requires the emergency activation policy to be enabled.",
-    });
   }
 
   if (!context.hasBeneficiaries) {

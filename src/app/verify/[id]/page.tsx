@@ -17,7 +17,7 @@ import { SkeletonCard } from "@/components/ui/Skeleton";
 import { useVaultById } from "@/hooks/useVault";
 import { formatAllocation, deriveVaultState } from "@/lib/vault/calculations";
 import { formatAssetAmount, formatDate } from "@/lib/format";
-import { getContractConfig } from "@/lib/stellar/contract";
+import { getContractConfig } from "@/lib/stellar/config";
 import { ACTIVATION_TRIGGER_LABELS } from "@/lib/vault/types";
 
 /**

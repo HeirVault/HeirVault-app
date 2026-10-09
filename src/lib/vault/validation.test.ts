@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import { TOTAL_ALLOCATION_BPS } from "./types";
 import {
+  LIMITS,
   allocationFromPercentInput,
   autoBalanceBeneficiaries,
   evenAllocationBps,
@@ -141,7 +142,11 @@ describe("validateBeneficiaries", () => {
     const many = Array.from({ length: 21 }, (_, index) =>
       makeBeneficiary({ id: `b${index}`, address: testAddress(index + 10), allocationBps: 476 }),
     );
-    expect(validateBeneficiaries(many).issues.some((issue) => issue.message.includes("at most 20"))).toBe(true);
+    expect(
+      validateBeneficiaries(many).issues.some((issue) =>
+        issue.message.includes(`at most ${LIMITS.maxBeneficiaries}`),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -210,7 +215,11 @@ describe("validateGuardians", () => {
     const many = Array.from({ length: 11 }, (_, index) =>
       makeGuardian({ id: `g${index}`, address: testAddress(index + 20) }),
     );
-    expect(validateGuardians(many, 1).issues.some((issue) => issue.message.includes("at most 10"))).toBe(true);
+    expect(
+      validateGuardians(many, 1).issues.some((issue) =>
+        issue.message.includes(`at most ${LIMITS.maxGuardians}`),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -245,17 +254,21 @@ describe("validateActivation", () => {
     ).toBe(false);
   });
 
-  it("bounds the grace period including zero", () => {
-    expect(validateActivation({ ...makeDraft().activation, gracePeriodDays: 0 }, context).valid).toBe(true);
+  it("bounds the grace period to the range the contract accepts", () => {
+    // @contract MIN_GRACE_PERIOD is 60 seconds, so zero days would be rejected
+    // by `create_vault`.
+    expect(validateActivation({ ...makeDraft().activation, gracePeriodDays: 0 }, context).valid).toBe(false);
     expect(validateActivation({ ...makeDraft().activation, gracePeriodDays: -1 }, context).valid).toBe(false);
     expect(validateActivation({ ...makeDraft().activation, gracePeriodDays: 366 }, context).valid).toBe(false);
+    expect(validateActivation({ ...makeDraft().activation, gracePeriodDays: 1 }, context).valid).toBe(true);
   });
 
-  it("requires a future activation date for scheduled vaults", () => {
-    const base = { ...makeDraft().activation, trigger: "scheduled" as const };
-    expect(validateActivation(base, context).issues.some((issue) => issue.field === "activation.scheduledActivationAt")).toBe(true);
-    expect(validateActivation({ ...base, scheduledActivationAt: "2020-01-01T00:00:00.000Z" }, context).issues.some((issue) => issue.message.includes("future"))).toBe(true);
-    expect(validateActivation({ ...base, scheduledActivationAt: "2999-01-01T00:00:00.000Z" }, context).valid).toBe(true);
+  it("requires guardians for multi-condition activation", () => {
+    const activation = { ...makeDraft().activation, trigger: "multi-condition" as const };
+    expect(validateActivation(activation, context).issues.some((issue) => issue.field === "guardians")).toBe(true);
+    expect(
+      validateActivation(activation, { guardians: [makeGuardian({ address: testAddress(3) })], hasBeneficiaries: true }).valid,
+    ).toBe(true);
   });
 
   it("requires guardians for guardian-approval activation", () => {
@@ -264,16 +277,6 @@ describe("validateActivation", () => {
     expect(
       validateActivation(activation, { guardians: [makeGuardian({ address: testAddress(3) })], hasBeneficiaries: true }).valid,
     ).toBe(true);
-  });
-
-  it("requires emergency activation for manual activation", () => {
-    const activation = { ...makeDraft().activation, trigger: "manual" as const };
-    expect(
-      validateActivation(activation, context).issues.some((issue) =>
-        issue.field === "activation.emergencyActivationEnabled",
-      ),
-    ).toBe(true);
-    expect(validateActivation({ ...activation, emergencyActivationEnabled: true }, context).valid).toBe(true);
   });
 
   it("requires beneficiaries", () => {

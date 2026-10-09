@@ -4,7 +4,7 @@ import { Alert } from "@/components/ui/Alert";
 import { AddressDisplay } from "@/components/ui/AddressDisplay";
 import { Card, CardBody, CardHeader } from "@/components/ui/Card";
 import { formatAssetAmount, formatDate } from "@/lib/format";
-import { getContractConfig } from "@/lib/stellar/contract";
+import { getContractConfig } from "@/lib/stellar/config";
 import type { Vault } from "@/lib/vault/types";
 
 export function VaultOverview({ vault }: { vault: Vault }) {

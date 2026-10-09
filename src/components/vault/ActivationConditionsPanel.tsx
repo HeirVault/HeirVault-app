@@ -24,19 +24,12 @@ export function ActivationConditionsPanel({
     { label: "Grace period", value: `${activation.gracePeriodDays} days` },
   ];
 
-  if (activation.trigger === "scheduled") {
-    rows.push({ label: "Scheduled activation", value: formatDate(activation.scheduledActivationAt) });
-  }
-  if (activation.trigger === "guardian-approval") {
+  if (activation.trigger === "guardian-approval" || activation.trigger === "multi-condition") {
     rows.push({
       label: "Guardian approvals",
       value: `${guardianApprovals} of ${activation.guardianThreshold} required (${guardianCount} guardians)`,
     });
   }
-  rows.push({
-    label: "Emergency activation",
-    value: activation.emergencyActivationEnabled ? "Enabled" : "Disabled",
-  });
   if (activatedAt) {
     rows.push({ label: "Activated", value: formatDate(activatedAt) });
   }
