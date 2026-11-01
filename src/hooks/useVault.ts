@@ -53,14 +53,15 @@ import {
 import { getTransactionUrl } from "@/lib/stellar/explorer";
 import { getNetworkConfig } from "@/lib/stellar/network";
 import {
-  buildTransaction,
-  IDLE_TRANSACTION,
-  prepareTransaction,
-  submitSignedTransaction,
-  TransactionRejectedError,
-  type SubmitResult,
-  type TransactionState,
-} from "@/lib/stellar/transactions";
+  ConfirmationTimeoutError,
+  TransactionFailedError,
+  WalletRejectedError,
+  submitOperation,
+  type TransactionPhase as SdkTransactionPhase,
+} from "heirvault-sdk";
+
+import { createSdkClient, walletSigner } from "@/lib/sdk/heirvault";
+import { IDLE_TRANSACTION, type SubmitResult, type TransactionState } from "@/lib/stellar/transactions";
 import { deriveVaultState, toBaseUnits } from "@/lib/vault/calculations";
 import {
   createDefaultRepository,
@@ -100,12 +101,39 @@ const VaultContext = createContext<VaultContextValue | null>(null);
 const NOT_CONFIGURED =
   "No HeirVault contract is configured in this environment. Set NEXT_PUBLIC_HEIRVAULT_CONTRACT_ID.";
 
+/** Map an SDK transaction phase onto the app's UI phase vocabulary. */
+function mapSdkPhase(phase: SdkTransactionPhase): TransactionState["phase"] {
+  switch (phase) {
+    case "awaiting-signature":
+      return "awaiting-signature";
+    case "submitted":
+    case "confirming":
+      return "submitted";
+    case "pending":
+      return "pending";
+    case "success":
+      return "success";
+    case "failed":
+      return "failed";
+    case "rejected":
+      return "rejected";
+    default:
+      return "building";
+  }
+}
+
 function toTransactionState(error: unknown): TransactionState {
   if (error instanceof ContractNotConfiguredError) {
     return { phase: "not-configured", error: error.message };
   }
-  if (error instanceof TransactionRejectedError) {
+  if (error instanceof WalletRejectedError) {
     return { phase: "rejected", error: error.message };
+  }
+  if (error instanceof ConfirmationTimeoutError) {
+    return { phase: "pending", hash: error.hash, error: error.message };
+  }
+  if (error instanceof TransactionFailedError) {
+    return { phase: "failed", hash: error.hash, error: error.message };
   }
   return {
     phase: "failed",
@@ -293,58 +321,40 @@ export function VaultProvider({ children }: { children: ReactNode }) {
 
       setTransaction({ phase: "building" });
       try {
-        const built = await buildTransaction({
-          sourceAddress: address,
-          operations,
-        });
-        const prepared = await prepareTransaction(built);
+        const client = createSdkClient({ address, sign: (envelope) => wallet.sign(envelope) });
+        const signer = walletSigner(address, (envelope) => wallet.sign(envelope));
 
-        setTransaction({ phase: "awaiting-signature" });
-        let signedXdr: string;
-        try {
-          signedXdr = await wallet.sign(prepared.transaction.toXDR());
-        } catch (signError) {
-          return {
-            ok: false,
-            state: toTransactionState(
-              signError instanceof TransactionRejectedError
-                ? signError
-                : new TransactionRejectedError(
-                    signError instanceof Error ? signError.message : undefined,
-                  ),
-            ),
-          };
+        let last: { hash: string; ledger?: number; rawReturnValue?: xdr.ScVal } | undefined;
+        // Soroban permits exactly one `invokeHostFunction` per transaction, so
+        // each operation is submitted as its own transaction. That is also what
+        // makes a partially completed multi-step deploy resumable.
+        for (const operation of operations) {
+          const result = await submitOperation<unknown>({
+            server: client.getServer(),
+            networkPassphrase: client.network.passphrase,
+            signer,
+            sourceAddress: address,
+            operation,
+            decode: (native) => native,
+            onPhase: (phase) => setTransaction({ phase: mapSdkPhase(phase) }),
+          });
+          last = { hash: result.hash, ledger: result.ledger, rawReturnValue: result.rawReturnValue };
         }
 
-        setTransaction({ phase: "submitted" });
-        const result = await submitSignedTransaction(signedXdr, network.id);
-
-        if (result.status === "success") {
-          return { ok: true, result };
-        }
-        if (result.status === "pending") {
-          return {
-            ok: false,
-            state: {
-              phase: "pending",
-              hash: result.hash,
-              error: result.error,
-            },
-          };
-        }
         return {
-          ok: false,
-          state: {
-            phase: "failed",
-            hash: result.hash,
-            error: result.error ?? "The transaction failed on-chain.",
+          ok: true,
+          result: {
+            hash: last!.hash,
+            status: "success",
+            ledger: last!.ledger,
+            returnValue: last!.rawReturnValue,
           },
         };
       } catch (actionError) {
         return { ok: false, state: toTransactionState(actionError) };
       }
     },
-    [network.id, wallet],
+    [wallet],
   );
 
   /**

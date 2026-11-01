@@ -215,8 +215,9 @@ describe("operation builders", () => {
   });
 
   it("rejects a vault id that is not a decimal number", () => {
-    expect(() => buildCheckInOp({ vaultId: "vault_abc" })).toThrow(/non-negative integer vault id/);
-    expect(() => buildCheckInOp({ vaultId: "-1" })).toThrow(/non-negative integer vault id/);
+    // Vault-id validation is now owned by the SDK (`parseVaultId`).
+    expect(() => buildCheckInOp({ vaultId: "vault_abc" })).toThrow(/non-negative integer/);
+    expect(() => buildCheckInOp({ vaultId: "-1" })).toThrow(/non-negative integer/);
   });
 
   it("deposit(vault_id, asset, amount) with an i128 amount", () => {
@@ -361,28 +362,33 @@ const live = describe.runIf(
 );
 
 live("live Testnet reads", () => {
-  it("reads the deployed contract's vault count and schema version", async () => {
-    const [count, schema] = await Promise.all([readVaultCount(), readSchemaVersion()]);
+  it(
+    "reads the deployed contract's vault count and schema version",
+    async () => {
+      const [count, schema] = await Promise.all([readVaultCount(), readSchemaVersion()]);
 
-    expect(Number.isInteger(count)).toBe(true);
-    expect(count).toBeGreaterThanOrEqual(0);
-    expect(schema).toBe(1);
-  });
+      expect(Number.isInteger(count)).toBe(true);
+      expect(count).toBeGreaterThanOrEqual(0);
+      expect(schema).toBe(1);
+    },
+    30_000,
+  );
 
   it.runIf(!!process.env.HEIRVAULT_LIVE_OWNER)(
     "decodes a real get_vaults_by_owner page",
     async () => {
-    const owner = process.env.HEIRVAULT_LIVE_OWNER as string;
+      const owner = process.env.HEIRVAULT_LIVE_OWNER as string;
 
-    const { readVaultsByOwner } = await import("./contract");
-    const page = await readVaultsByOwner(owner, { limit: 5 });
+      const { readVaultsByOwner } = await import("./contract");
+      const page = await readVaultsByOwner(owner, { limit: 5 });
 
-    expect(page.meta.total).toBeGreaterThanOrEqual(0);
-    expect(page.items.length).toBeLessThanOrEqual(5);
-    for (const item of page.items) {
-      expect(item.owner).toBe(owner);
-      expect(item.id).toMatch(/^\d+$/);
-    }
+      expect(page.meta.total).toBeGreaterThanOrEqual(0);
+      expect(page.items.length).toBeLessThanOrEqual(5);
+      for (const item of page.items) {
+        expect(item.owner).toBe(owner);
+        expect(item.id).toMatch(/^\d+$/);
+      }
     },
+    30_000,
   );
 });

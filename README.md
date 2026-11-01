@@ -43,7 +43,7 @@ If a piece is missing (for example the contract repo), treat it as out of scope 
 
 - **Framework:** Next.js 15 (App Router).
 - **UI:** React 19 + TypeScript, Tailwind CSS, custom UI component library under `src/components/ui`.
-- **Blockchain:** Stellar/Soroban via `@stellar/stellar-sdk` and `@stellar/freighter-api`. Wallet connection via Freighter.
+- **Blockchain:** Stellar/Soroban via `heirvault-sdk`, `@stellar/stellar-sdk` and `@stellar/freighter-api`. All contract invocations, XDR serialization, error handling, and transaction lifecycle phases (simulate → prepare → authorize → submit → confirm) are driven through `heirvault-sdk`. Wallet connection via Freighter.
 - **Testing:** Vitest for unit tests; React Testing Library for component/hook tests.
 - **Lint/Type:** ESLint + TypeScript (`tsc --noEmit`).
 

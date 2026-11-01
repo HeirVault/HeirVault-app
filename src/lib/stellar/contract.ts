@@ -20,20 +20,23 @@
  * {@link ContractNotConfiguredError} before touching the network.
  */
 
+import { Contract, scValToNative, xdr } from "@stellar/stellar-sdk";
+
+// Reusable contract-interaction logic lives in the SDK. This module encodes
+// arguments and simulates reads through the SDK so the ABI has a single source
+// of truth; the decoders below map contract values onto the app's domain types.
 import {
-  Account,
-  Address,
-  BASE_FEE,
-  Contract,
-  TransactionBuilder,
-  nativeToScVal,
-  rpc,
-  scValToNative,
-  xdr,
-} from "@stellar/stellar-sdk";
+  addressToScVal,
+  activationModeToScVal as sdkActivationModeToScVal,
+  i128ToScVal,
+  parseVaultId,
+  simulateRead as sdkSimulateRead,
+  symbolToScVal,
+  u32ToScVal,
+  u64ToScVal,
+} from "heirvault-sdk";
 
 import { fromBaseUnits } from "@/lib/vault/calculations";
-import { encodeEd25519PublicKey } from "@/lib/vault/strkey";
 import type {
   ActivationTrigger,
   Beneficiary,
@@ -145,31 +148,27 @@ export type VaultStatusValue = (typeof VAULT_STATUS_VALUES)[number];
 // ---------------------------------------------------------------------------
 
 function addressScVal(address: string): xdr.ScVal {
-  return new Address(address).toScVal();
+  return addressToScVal(address);
 }
 
 function symbolScVal(value: string): xdr.ScVal {
-  return nativeToScVal(value, { type: "symbol" });
+  return symbolToScVal(value);
 }
 
 function u32ScVal(value: number): xdr.ScVal {
-  return nativeToScVal(value, { type: "u32" });
+  return u32ToScVal(value);
 }
 
 function u64ScVal(value: bigint): xdr.ScVal {
-  return nativeToScVal(value, { type: "u64" });
+  return u64ToScVal(value);
 }
 
 function i128ScVal(value: bigint): xdr.ScVal {
-  return nativeToScVal(value, { type: "i128" });
+  return i128ToScVal(value);
 }
 
 function u64FromDecimalString(value: string): bigint {
-  const trimmed = value.trim();
-  if (!/^\d+$/.test(trimmed)) {
-    throw new Error(`Expected a non-negative integer vault id, received ${value}.`);
-  }
-  return BigInt(trimmed);
+  return parseVaultId(value);
 }
 
 function structScVal(fields: Record<string, xdr.ScVal>): xdr.ScVal {
@@ -194,7 +193,7 @@ export function beneficiaryToScVal(beneficiary: Beneficiary): xdr.ScVal {
  * point's arguments.
  */
 export function activationModeScVal(mode: ActivationModeValue): xdr.ScVal {
-  return xdr.ScVal.scvVec([symbolScVal(mode)]);
+  return sdkActivationModeToScVal(mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -489,13 +488,6 @@ export function buildClaimOp(args: ClaimArgs): xdr.Operation {
 // ---------------------------------------------------------------------------
 // Reads: Soroban ScVal → domain types
 // ---------------------------------------------------------------------------
-
-/**
- * A deterministic, format-valid account used as the read-only transaction
- * source when simulating reads. Simulation never submits, so this address only
- * needs to be well-formed.
- */
-const READ_ONLY_SOURCE = encodeEd25519PublicKey(new Uint8Array(32).fill(0x42));
 
 /** Raised when a contract read cannot be simulated or its result decoded. */
 export class ContractReadError extends Error {
@@ -1003,24 +995,20 @@ async function simulateRead(
   args: xdr.ScVal[],
   options: ReadOptions = {},
 ): Promise<unknown> {
-  const server = getRpcServer(options.network);
-  const source = new Account(options.sourceAddress ?? READ_ONLY_SOURCE, "0");
-  const transaction = new TransactionBuilder(source, {
-    fee: BASE_FEE,
-    networkPassphrase: getNetworkConfig(options.network).passphrase,
-  })
-    .addOperation(getContract().call(method, ...args))
-    .setTimeout(30)
-    .build();
-
-  const simulation = await server.simulateTransaction(transaction);
-  if (rpc.Api.isSimulationError(simulation)) {
-    throw new ContractReadError(`Contract read failed: ${simulation.error}`);
+  try {
+    return await sdkSimulateRead({
+      server: getRpcServer(options.network),
+      networkPassphrase: getNetworkConfig(options.network).passphrase,
+      contractId: requireContractId(),
+      method,
+      args,
+      ...(options.sourceAddress ? { sourceAddress: options.sourceAddress } : {}),
+    });
+  } catch (error) {
+    // Preserve this module's public error type so callers can keep treating a
+    // failed read as a `ContractReadError`.
+    throw new ContractReadError(error instanceof Error ? error.message : String(error));
   }
-  if (!simulation.result) {
-    throw new ContractReadError("The contract returned no value for this read.");
-  }
-  return scValToNative(simulation.result.retval);
 }
 
 function contextFor(options: ReadOptions): VaultDecodeContext {

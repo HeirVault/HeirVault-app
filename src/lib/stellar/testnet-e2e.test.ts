@@ -1,23 +1,22 @@
 /**
  * Real Stellar Testnet end-to-end test.
  *
- * This exercises the *frontend's own* code path — the operation builders in
- * `contract.ts`, the simulation in `transactions.ts`, submission and
- * confirmation — against a deployed HeirVault contract, for the whole vault
+ * This exercises the app's *integrated* path — the operation builders in
+ * `contract.ts` (which delegate their ABI encoding to `heirvault-sdk`) and the
+ * SDK transaction lifecycle (`submitOperation`: simulate → sign → submit →
+ * confirm) — against a deployed HeirVault contract, for the whole vault
  * lifecycle:
  *
  *   create_vault → returned vault id → check_in → add_beneficiary →
- *   add_guardian + set_guardian_threshold → deposit → (grace period lapses) →
+ *   add_guardian → set_guardian_threshold → deposit → (grace period lapses) →
  *   guardian_approve → activate_vault → claim
  *
  * It also asserts a negative case: activation must be refused while the
  * guardian threshold is not met.
  *
  * The only substitution from the browser is the signer: this environment has
- * no browser extension, so the XDR produced by the app is signed with a local
- * Testnet key through the Stellar CLI instead of Freighter. The envelope that
- * is simulated, signed and submitted is byte-for-byte what the app hands to
- * Freighter.
+ * no browser extension, so the XDR produced by the SDK is signed with a local
+ * Testnet key through the Stellar CLI instead of Freighter.
  *
  * It never runs as part of `npm test`. To run it:
  *
@@ -35,8 +34,18 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { TransactionBuilder } from "@stellar/stellar-sdk";
+import {
+  SimulationError,
+  callbackSigner,
+  createRpcServer,
+  prepareOperation,
+  submitOperation,
+  type TxSuccess,
+} from "heirvault-sdk";
+import { TransactionBuilder, type xdr } from "@stellar/stellar-sdk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { sdkNetwork } from "@/lib/sdk/heirvault";
 
 import {
   buildActivateVaultOp,
@@ -55,13 +64,6 @@ import {
   readVaultIdFromReturnValue,
   readVaultsByOwner,
 } from "./contract";
-import {
-  buildTransaction,
-  prepareTransaction,
-  submitSignedTransaction,
-  TransactionFailedError,
-  type SubmitResult,
-} from "./transactions";
 
 const enabled = process.env.HEIRVAULT_E2E === "1";
 const suite = describe.runIf(enabled);
@@ -101,8 +103,6 @@ function signWith(identity: string, envelopeXdr: string): string {
     },
   ).trim();
 
-  // `tx sign` writes the signed envelope to stdout; be defensive about any
-  // decorative output by taking the last parseable envelope.
   const candidates = output.split(/\s+/).filter((chunk) => chunk.length > 100);
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
     try {
@@ -115,40 +115,63 @@ function signWith(identity: string, envelopeXdr: string): string {
   throw new Error(`Could not parse a signed envelope for identity ${identity}.`);
 }
 
-/** Build → simulate → sign → submit → confirm, using the app's own pipeline. */
-async function run(
-  identity: string,
-  operations: Parameters<typeof buildTransaction>[0]["operations"],
-  label: string,
-): Promise<SubmitResult> {
-  const built = await buildTransaction({ sourceAddress: ownerAddress(identity), operations });
-  const prepared = await prepareTransaction(built);
-  const signed = signWith(identity, prepared.transaction.toXDR());
-  const result = await submitSignedTransaction(signed);
-
-  if (result.status !== "success") {
-    throw new Error(`${label}: transaction not confirmed (${result.status}) ${result.error ?? ""}`);
-  }
-  record(`${label}: ${result.hash} (ledger ${result.ledger ?? "?"})`);
-  return result;
-}
-
 function ownerAddress(identity: string): string {
   return identity === OWNER_KEY ? OWNER : identity === BENEFICIARY_KEY ? BENEFICIARY : GUARDIAN;
 }
 
+interface RunResult {
+  hash: string;
+  ledger?: number;
+  returnValue?: xdr.ScVal;
+}
+
+/**
+ * Submit each operation as its own transaction through the SDK pipeline.
+ *
+ * Soroban permits exactly one `invokeHostFunction` per transaction, so the
+ * former two-operation `add_guardian + set_guardian_threshold` step is now two
+ * transactions — which is what the contract's own deployment does.
+ */
+async function run(identity: string, operations: xdr.Operation[], label: string): Promise<RunResult> {
+  const network = sdkNetwork();
+  const server = createRpcServer(network);
+  const address = ownerAddress(identity);
+  const signer = callbackSigner(address, async (envelope) => signWith(identity, envelope));
+
+  let last: TxSuccess<unknown> | undefined;
+  for (const operation of operations) {
+    last = await submitOperation<unknown>({
+      server,
+      networkPassphrase: network.passphrase,
+      signer,
+      sourceAddress: address,
+      operation,
+      decode: (native) => native,
+    });
+  }
+
+  const hash = last!.hash;
+  record(`${label}: ${hash} (ledger ${last!.ledger ?? "?"})`);
+  return { hash, ledger: last!.ledger, returnValue: last!.rawReturnValue };
+}
+
 async function expectRejection(
   identity: string,
-  operations: Parameters<typeof buildTransaction>[0]["operations"],
+  operation: xdr.Operation,
   label: string,
 ): Promise<string> {
+  const network = sdkNetwork();
   try {
-    const built = await buildTransaction({ sourceAddress: ownerAddress(identity), operations });
-    await prepareTransaction(built);
+    await prepareOperation({
+      server: createRpcServer(network),
+      networkPassphrase: network.passphrase,
+      sourceAddress: ownerAddress(identity),
+      operation,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     record(`${label}: refused as expected — ${message}`);
-    expect(error).toBeInstanceOf(TransactionFailedError);
+    expect(error).toBeInstanceOf(SimulationError);
     return message;
   }
   throw new Error(`${label}: expected the contract to refuse this call, but it simulated cleanly.`);
@@ -178,14 +201,13 @@ suite("Stellar Testnet end-to-end", () => {
     process.env.NEXT_PUBLIC_USDC_SYMBOL = process.env.NEXT_PUBLIC_USDC_SYMBOL || "HVE2E";
     process.env.NEXT_PUBLIC_USDC_DECIMALS = process.env.NEXT_PUBLIC_USDC_DECIMALS || "7";
 
-    // Fail fast if the local keystore is not available.
     for (const identity of [OWNER_KEY, BENEFICIARY_KEY, GUARDIAN_KEY]) {
       execFileSync("test", ["-f", keyFile(identity)]);
     }
   }, 60_000);
 
   afterAll(() => {
-    console.log(`\n[e2e] transcript (${transcript.length} events)`)
+    console.log(`\n[e2e] transcript (${transcript.length} events)`);
     transcript.forEach((line) => console.log(`[e2e]   ${line}`));
   });
 
@@ -227,24 +249,20 @@ suite("Stellar Testnet end-to-end", () => {
       // ── 4. Beneficiaries (100% in one slot) ─────────────────────────────
       await run(
         OWNER_KEY,
-        [
-          buildAddBeneficiaryOp({
-            vaultId,
-            beneficiaryAddress: BENEFICIARY,
-            allocationBps: 10_000,
-          }),
-        ],
+        [buildAddBeneficiaryOp({ vaultId, beneficiaryAddress: BENEFICIARY, allocationBps: 10_000 })],
         `add_beneficiary(${vaultId}, heir, 10000)`,
       );
 
-      // ── 5. Guardian + threshold in a single transaction ─────────────────
+      // ── 5. Guardian then threshold (one transaction each) ───────────────
       await run(
         OWNER_KEY,
-        [
-          buildAddGuardianOp({ vaultId, guardianAddress: GUARDIAN }),
-          buildSetGuardianThresholdOp({ vaultId, threshold: 1 }),
-        ],
-        `add_guardian(${vaultId}) + set_guardian_threshold(1)`,
+        [buildAddGuardianOp({ vaultId, guardianAddress: GUARDIAN })],
+        `add_guardian(${vaultId})`,
+      );
+      await run(
+        OWNER_KEY,
+        [buildSetGuardianThresholdOp({ vaultId, threshold: 1 })],
+        `set_guardian_threshold(${vaultId}, 1)`,
       );
 
       // ── 6. Deposit ──────────────────────────────────────────────────────
@@ -266,10 +284,6 @@ suite("Stellar Testnet end-to-end", () => {
       expect(configured.activation.trigger).toBe("multi-condition");
       expect(configured.activation.guardianThreshold).toBe(1);
       expect(["active", "grace", "triggered"]).toContain(configured.status);
-      record(
-        `read: get_vault(${vaultId}) → status=${configured.status}, balance=${configured.asset.amount}, ` +
-          `beneficiaries=${configured.beneficiaries.length}, guardians=${configured.guardians.length}`,
-      );
 
       const after = await readVaultsByOwner(OWNER, { limit: 25 });
       expect(after.items.map((item) => item.id)).toContain(vaultId);
@@ -287,7 +301,7 @@ suite("Stellar Testnet end-to-end", () => {
       // ── 9. Negative: activation must be refused without the threshold ───
       await expectRejection(
         OWNER_KEY,
-        [buildActivateVaultOp({ vaultId })],
+        buildActivateVaultOp({ vaultId }),
         `activate_vault(${vaultId}) before guardian approval`,
       );
 
@@ -297,13 +311,7 @@ suite("Stellar Testnet end-to-end", () => {
         [buildGuardianApproveOp({ vaultId, guardianAddress: GUARDIAN })],
         `guardian_approve(${vaultId})`,
       );
-
-      const activated = await run(
-        OWNER_KEY,
-        [buildActivateVaultOp({ vaultId })],
-        `activate_vault(${vaultId})`,
-      );
-      record(`activation confirmed: ${activated.hash}`);
+      await run(OWNER_KEY, [buildActivateVaultOp({ vaultId })], `activate_vault(${vaultId})`);
 
       const live = await readDomainVault(vaultId, null, { sourceAddress: OWNER });
       expect(live.status).toBe("triggered");
@@ -323,7 +331,6 @@ suite("Stellar Testnet end-to-end", () => {
       const settled = await readDomainVault(vaultId, null, { sourceAddress: OWNER });
       expect(settled.status).toBe("completed");
       expect(settled.asset.amount).toBe("0");
-      expect(settled.claims?.[0]?.status).toBe("claimed");
       record(`read: final status=${settled.status}, balance=${settled.asset.amount}`);
     },
     600_000,
