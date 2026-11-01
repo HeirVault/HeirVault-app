@@ -78,6 +78,14 @@ export function StepActivation({ draft, update, showErrors }: WizardStepProps) {
           hint="Extra time after a missed check-in before activation."
           required
         />
+
+        {activation.checkInIntervalDays > 90 && (
+          <div className="sm:col-span-2">
+            <Alert tone="warning" title="Extended Inactivity & Storage TTL Notice">
+              Check-in periods longer than 90 days exceed Soroban&apos;s standard persistent entry TTL (~90 days threshold, ~120 days max). Although check-ins and read queries refresh this window, dormant vaults inactive for over 90–120 days require periodic keeper pings or restoration if archived by the network.
+            </Alert>
+          </div>
+        )}
       </div>
 
       {(activation.trigger === "guardian-approval" || activation.trigger === "multi-condition") && (
