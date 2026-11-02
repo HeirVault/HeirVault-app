@@ -17,7 +17,7 @@
   "dependencies": {
     "@stellar/freighter-api": "^4.0.0",
     "@stellar/stellar-sdk": "^13.1.0",
-    "heirvault-sdk": "file:../sdk",
+    "heirvault-sdk": "file:./vendor/heirvault-sdk-0.1.0.tgz",
     "next": "^15.5.27",
     "react": "19.0.0",
     "react-dom": "19.0.0"

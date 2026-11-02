@@ -10,46 +10,27 @@ jobs:
     name: Frontend (typecheck / lint / test / build)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Frontend
+      - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          path: frontend
-
-      - name: Checkout SDK
-        uses: actions/checkout@v4
-        with:
-          repository: HeirVault/heirvault-sdk
-          path: sdk
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Build SDK
-        working-directory: sdk
-        run: |
-          npm ci
-          npm run build
-
-      - name: Install Frontend Dependencies
-        working-directory: frontend
+      - name: Install Dependencies
         run: npm ci
 
       - name: Type-check
-        working-directory: frontend
         run: npm run typecheck
 
       - name: Lint
-        working-directory: frontend
         run: npm run lint
 
       - name: Unit Tests
-        working-directory: frontend
         run: npm run test
 
       - name: Production Build
-        working-directory: frontend
         env:
           NEXT_TELEMETRY_DISABLED: "1"
         run: npm run build
